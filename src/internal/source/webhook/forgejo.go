@@ -152,6 +152,14 @@ type commentField struct {
 	CreatedAt string     `json:"created_at"`
 	URL       string     `json:"html_url"`
 	User      *userField `json:"user"`
+	// Path and Line are the comment's inline location: the commented
+	// file and the line within it. Forgejo webhooks do not deliver
+	// inline comment locations today (the payload for review comments
+	// carries no comment content or position; see forgejo#7935 and
+	// #7966), so these are empty on current instances and are parsed
+	// only when a delivery carries them.
+	Path string `json:"path"`
+	Line int    `json:"line"`
 }
 
 type pullRequestField struct {
@@ -256,6 +264,12 @@ func (a *ForgejoAdapter) parseIssueComment(body []byte, project string) ([]event
 			CreatedAt: p.Comment.CreatedAt,
 			MR:        &mr,
 		},
+	}
+	if p.Comment.Path != "" {
+		ev.Comment.Position = &event.CommentPosition{
+			File: p.Comment.Path,
+			Line: p.Comment.Line,
+		}
 	}
 	if p.Comment.User != nil {
 		ev.Comment.Author = personFromUser(p.Comment.User)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"minas-tirith/internal/config"
+	"minas-tirith/internal/configstore"
 	"minas-tirith/internal/event"
 )
 
@@ -23,10 +24,9 @@ const serverTestSecret = "server-test-secret"
 func newTestServer(t *testing.T) (*Server, *recorder) {
 	t.Helper()
 	srv, err := New(context.Background(), &config.Config{
-		ListenAddr:   ":0",
-		Secret:       serverTestSecret,
-		WatchedRepos: []string{"BeanieGenie"},
-		DedupeTTL:    time.Hour,
+		ListenAddr: ":0",
+		Store:      configstore.Static{{Project: "BeanieGenie", Secret: serverTestSecret}},
+		DedupeTTL:  time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)

@@ -49,12 +49,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		},
 	}
 
-	// The webhook event source, with its provider adapters. New providers
-	// are one RegisterProvider call away; new sources are one AddSource
+	// The webhook event source, with its provider adapters. Watched
+	// repositories and their secrets come from the declarative config
+	// store. New providers are one RegisterProvider call away; new stores
+	// are one Store implementation away; new sources are one AddSource
 	// call away, without touching dispatch.
 	webhookSource := webhook.NewSource(webhook.Config{
-		Secret:    cfg.Secret,
-		Watched:   cfg.WatchedRepos,
+		Store:     cfg.Store,
 		DedupeTTL: cfg.DedupeTTL,
 	})
 	webhookSource.RegisterProvider(webhook.NewForgejoAdapter("forgejo"))
@@ -94,7 +95,7 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("event listener listening", "addr", s.cfg.ListenAddr, "watched", s.cfg.WatchedRepos)
+		slog.Info("event listener listening", "addr", s.cfg.ListenAddr)
 		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

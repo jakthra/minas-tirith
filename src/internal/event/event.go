@@ -55,14 +55,27 @@ type Commit struct {
 	Modified  []string `json:"modified,omitempty"`
 }
 
+// CommentPosition is a comment's inline location: the file (and the line
+// within it) the comment was posted on. A summary comment on the merge
+// request overall carries no position. Providers that cannot report
+// inline locations (Forgejo webhooks today) leave Position nil, and
+// consumers infer inline-ness from the comment body instead.
+type CommentPosition struct {
+	// File is the commented file's path from the repository root.
+	File string `json:"file"`
+	// Line is the commented line number within File, 0 when unknown.
+	Line int `json:"line,omitempty"`
+}
+
 // Comment holds the details of a merge request comment.
 type Comment struct {
-	ID        int64         `json:"id"`
-	Body      string        `json:"body,omitempty"`
-	URL       string        `json:"url,omitempty"`
-	Author    Person        `json:"author,omitempty"`
-	CreatedAt string        `json:"created_at,omitempty"` // provider-formatted comment time
-	MR        *MergeRequest `json:"mr,omitempty"`
+	ID        int64             `json:"id"`
+	Body      string            `json:"body,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Author    Person            `json:"author,omitempty"`
+	CreatedAt string            `json:"created_at,omitempty"` // provider-formatted comment time
+	MR        *MergeRequest     `json:"mr,omitempty"`
+	Position  *CommentPosition  `json:"position,omitempty"` // inline location, when the provider reports one
 }
 
 // Event is a provider-agnostic repository event. Exactly one of Commit or

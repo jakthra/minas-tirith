@@ -1,0 +1,15 @@
+# Default watched-repositories config for local development.
+#
+# The listener and worker load ./watched.yaml when WATCHED_CONFIG and
+# -watched-config are unset, so running from src/ picks this file up
+# automatically: go run ./cmd/listener or go run ./cmd/worker.
+#
+# It watches the local development Forgejo instance's test repository
+# (forgejo/docker-compose.yaml, http://localhost:3000) with the dev
+# webhook secret used in the README's wiring examples. Point
+# WATCHED_CONFIG elsewhere for anything beyond local development, and
+# change the secret before any real use.
+
+repos:
+  - project: BeanieGenie
+    secret: s3cret

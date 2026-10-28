@@ -1,1 +1,5 @@
 /forgejo/forgejo
+
+# Local development configuration: secrets and overrides live in
+# src/.env (src/.env.example is the committed template).
+/src/.env

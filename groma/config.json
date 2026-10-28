@@ -1,0 +1,21 @@
+{
+  "scanners": [
+    {
+      "id": "go",
+      "source": "@groma/scanner-go@0.2.3",
+      "include": [
+        "**/*.go",
+        "**/go.mod"
+      ],
+      "exclude": [
+        "vendor/"
+      ]
+    }
+  ],
+  "workSources": [
+    {
+      "id": "backlog",
+      "version": "1.54.0"
+    }
+  ]
+}

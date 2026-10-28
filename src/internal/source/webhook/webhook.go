@@ -6,20 +6,24 @@
 // The source itself is provider-agnostic. Provider-specific details (header
 // names, signature scheme, payload format) live in Provider adapters
 // registered under a name; the adapter named in the route's {provider}
-// segment handles the delivery. New providers register without changes to
-// routing, authentication dispatch, or dedupe.
+// segment handles the delivery. Which repositories are watched, and the
+// secret each one authenticates with, come from the declarative config store.
+// New providers or stores register without changes to routing, dispatch, or
+// dedupe.
 package webhook
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"minas-tirith/internal/configstore"
 	"minas-tirith/internal/dedupe"
 	"minas-tirith/internal/event"
 	"minas-tirith/internal/source"
@@ -39,8 +43,8 @@ type Provider interface {
 	// Name is the {provider} path segment the adapter is served under.
 	Name() string
 
-	// Verify authenticates the delivery using the shared secret. It must
-	// not consume or modify the body.
+	// Verify authenticates the delivery using the addressed repository's
+	// webhook secret. It must not consume or modify the body.
 	Verify(header http.Header, body []byte, secret string) error
 
 	// Parse converts an authenticated delivery into zero or more events.
@@ -52,10 +56,10 @@ type Provider interface {
 
 // Config configures the webhook source.
 type Config struct {
-	// Secret is the shared secret providers use to sign deliveries.
-	Secret string
-	// Watched lists the project names deliveries are accepted for.
-	Watched []string
+	// Store loads the watched repositories and their webhook secrets.
+	// Deliveries are verified with the secret of the project they are
+	// addressed to, so each watched repository can have its own secret.
+	Store configstore.Store
 	// DedupeTTL is how long event identities are remembered so duplicate
 	// deliveries are dropped. Defaults to 24h when zero.
 	DedupeTTL time.Duration
@@ -67,12 +71,13 @@ type Config struct {
 type Source struct {
 	cfg       Config
 	dedupe    *dedupe.Store
-	watched   map[string]struct{}
+	repos     map[string]string // watched project -> its webhook secret
 	providers map[string]Provider
 }
 
-// NewSource creates a webhook source for the given configuration. Providers
-// must be registered via RegisterProvider before Start.
+// NewSource creates a webhook source for the given configuration.
+// Providers must be registered via RegisterProvider before Start; the
+// watched repositories are loaded from the config store at Start.
 func NewSource(cfg Config) *Source {
 	if cfg.DedupeTTL <= 0 {
 		cfg.DedupeTTL = 24 * time.Hour
@@ -80,14 +85,9 @@ func NewSource(cfg Config) *Source {
 	if cfg.MaxBodySize <= 0 {
 		cfg.MaxBodySize = defaultMaxBodySize
 	}
-	watched := make(map[string]struct{}, len(cfg.Watched))
-	for _, p := range cfg.Watched {
-		watched[p] = struct{}{}
-	}
 	return &Source{
 		cfg:       cfg,
 		dedupe:    dedupe.NewStore(cfg.DedupeTTL),
-		watched:   watched,
 		providers: make(map[string]Provider),
 	}
 }
@@ -100,18 +100,52 @@ func (s *Source) RegisterProvider(p Provider) {
 // Name implements source.EventSource.
 func (s *Source) Name() string { return "webhook" }
 
-// Start implements source.EventSource: webhooks are passive, so Start only
-// validates configuration and returns the route the listener must serve.
+// Start implements source.EventSource: webhooks are passive, so Start loads
+// the watched repositories and their secrets from the config store,
+// validates configuration, and returns the route the listener must serve.
 func (s *Source) Start(ctx context.Context, d source.Dispatcher) ([]source.Route, error) {
-	if s.cfg.Secret == "" {
-		return nil, errors.New("webhook source: shared secret is not configured")
+	if s.cfg.Store == nil {
+		return nil, errors.New("webhook source: config store is not configured")
 	}
-	if len(s.watched) == 0 {
-		return nil, errors.New("webhook source: no watched repositories configured")
+	repos, err := s.cfg.Store.Repositories()
+	if err != nil {
+		return nil, fmt.Errorf("webhook source: load watched repositories: %w", err)
+	}
+
+	// The store's declarations are trusted but checked: a broken store
+	// fails startup loudly instead of deliveries quietly. Every problem
+	// is reported in one error.
+	var errs []error
+	watched := make(map[string]string, len(repos))
+	projects := make([]string, 0, len(repos))
+	for _, r := range repos {
+		switch {
+		case r.Project == "":
+			errs = append(errs, errors.New("webhook source: watched repository without a project name"))
+			continue
+		case r.Secret == "":
+			errs = append(errs, fmt.Errorf("webhook source: watched repository %q has no webhook secret", r.Project))
+			continue
+		}
+		if _, dup := watched[r.Project]; dup {
+			errs = append(errs, fmt.Errorf("webhook source: watched repository %q is declared more than once", r.Project))
+			continue
+		}
+		watched[r.Project] = r.Secret
+		projects = append(projects, r.Project)
+	}
+	if len(watched) == 0 {
+		errs = append(errs, errors.New("webhook source: no watched repositories configured"))
 	}
 	if len(s.providers) == 0 {
-		return nil, errors.New("webhook source: no providers registered")
+		errs = append(errs, errors.New("webhook source: no providers registered"))
 	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	s.repos = watched
+	slog.Info("webhook source watching repositories", "projects", projects)
+
 	return []source.Route{{
 		Method:  http.MethodPost,
 		Pattern: RoutePattern,
@@ -133,7 +167,8 @@ func (h *deliveryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Only deliveries for watched projects and registered providers are
 	// accepted. Not found (rather than forbidden) avoids revealing which
 	// projects exist.
-	if _, ok := h.src.watched[project]; !ok {
+	secret, ok := h.src.repos[project]
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
@@ -163,7 +198,8 @@ func (h *deliveryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Unauthenticated deliveries are rejected before parsing anything.
-	if err := provider.Verify(r.Header, body, h.src.cfg.Secret); err != nil {
+	// Each delivery is verified with the addressed project's own secret.
+	if err := provider.Verify(r.Header, body, secret); err != nil {
 		logger.Warn("rejecting unauthenticated delivery", "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
