@@ -214,12 +214,21 @@ func (f *Fake) Commit(_ context.Context, repo, branch, _ string, files []FileCha
 	r.nextSHA++
 	sha := "fakesha" + strconv.Itoa(r.nextSHA)
 	b.sha = sha
-	r.shas[sha] = b
+	// Record the branch state at this commit, so reading a file at a
+	// commit SHA returns that commit's content even after the branch
+	// moved on (GetFile/ListFiles accept commit SHAs as refs).
+	snapshot := newFakeBranch(b.name)
+	snapshot.sha = sha
+	for p, file := range b.files {
+		snapshot.files[p] = file
+	}
+	r.shas[sha] = snapshot
 	return CommitResult{SHA: sha, URL: "http://fake/" + repo + "/commit/" + sha}, nil
 }
 
-// CreateMergeRequest implements Client.
-func (f *Fake) CreateMergeRequest(_ context.Context, repo, title, description, head, base string) (MergeRequest, error) {
+// CreateMergeRequest implements Client. The fake records draft as given
+// and returns it from GetMergeRequest too.
+func (f *Fake) CreateMergeRequest(_ context.Context, repo, title, description, head, base string, draft bool) (MergeRequest, error) {
 	if err := f.op(); err != nil {
 		return MergeRequest{}, err
 	}
@@ -236,6 +245,7 @@ func (f *Fake) CreateMergeRequest(_ context.Context, repo, title, description, h
 		Title:       title,
 		Description: description,
 		State:       "open",
+		Draft:       draft,
 		Head:        head,
 		Base:        base,
 		URL:         "http://fake/" + repo + "/pulls/" + strconv.FormatInt(number, 10),

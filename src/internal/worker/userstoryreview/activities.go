@@ -15,11 +15,12 @@ import (
 
 	"minas-tirith/internal/llm"
 	"minas-tirith/internal/provider"
+	"minas-tirith/internal/worker/backlog"
 )
 
-// storyDir is the repository directory holding user stories and backlog
-// tasks in backlog.md markdown format.
-const storyDir = "backlog/tasks/"
+// storyDir is the repository directory holding user stories in
+// backlog.md markdown format.
+const storyDir = backlog.Dir
 
 // Activities holds the dependencies the user story review activities
 // need: the provider client for repository access and the LLM client for
@@ -39,9 +40,11 @@ func NewActivities(p provider.Client, l llm.Client) *Activities {
 	return &Activities{provider: p, llm: l}
 }
 
-// AnalyzeCommit inspects a commit's file changes and reports whether it
-// refines a user story: a commit that adds or modifies a file under
-// backlog/tasks/ (a backlog.md markdown file) needs refinement.
+// AnalyzeCommit re-checks a commit's user story files before the workflow
+// acts on them: a commit on one of the agent's own refinement branches, or
+// one whose classified user story files are empty, needs no refinement.
+// The files themselves were classified by the shared backlog
+// classification before the workflow started.
 func (a *Activities) AnalyzeCommit(ctx context.Context, in Input) (Analysis, error) {
 	if err := in.Validate(); err != nil {
 		return Analysis{}, err
@@ -55,30 +58,47 @@ func (a *Activities) AnalyzeCommit(ctx context.Context, in Input) (Analysis, err
 	return analyzeCommit(in)
 }
 
+// RefineCommit re-checks a commit the routing decision assigned to this
+// agent before the workflow acts on it: it reports false for a commit on
+// any agent branch (the trigger declines those; this guards manual
+// starts) or one with no user story file. It runs as a Temporal activity
+// so the event bridge can make the same decision before starting the
+// workflow.
+func (a *Activities) RefineCommit(ctx context.Context, in Input) (bool, error) {
+	analysis, err := analyzeCommit(in)
+	if err != nil {
+		return false, err
+	}
+	return analysis.NeedsRefinement, nil
+}
+
 // analyzeCommit is the pure logic of AnalyzeCommit, separated so unit
-// tests can exercise it without a Temporal activity context.
+// tests can exercise it without a Temporal activity context. It re-checks
+// the routing decision the workflow started with: the shared backlog
+// classification supplies the commit's user story files, and this step
+// keeps only the ones a review may act on.
 func analyzeCommit(in Input) (Analysis, error) {
 	if err := in.Validate(); err != nil {
 		return Analysis{}, err
 	}
 
-	// A commit on one of the agent's own refinement branches carries
-	// generated ticket files, never a new user story. The trigger
+	// A commit on any agent branch (refine/* or implement/*) carries
+	// agent-generated files, never a new user story. The trigger
 	// declines these commits; this guards manual workflow starts from
-	// re-triggering the agent on its own work.
-	if strings.HasPrefix(in.Branch, RefinementBranchPrefix) {
+	// re-triggering an agent on its own work.
+	if backlog.IsAgentBranch(in.Branch) {
 		return Analysis{
 			NeedsRefinement: false,
-			Reason:          "commit is on a " + RefinementBranchPrefix + " refinement branch the agent itself maintains",
+			Reason:          "commit is on an agent branch (" + RefinementBranchPrefix + "* or " + backlog.ImplementationBranchPrefix + "*) the agents themselves maintain",
 		}, nil
 	}
 
-	// A story file is added or modified (removed stories are not
-	// refinements; they are deletions).
+	// Removed stories are deletions, not refinements: the classification
+	// already excludes them from StoryPaths.
 	var storyPaths []string
 	seen := make(map[string]bool)
-	for _, path := range append(append([]string{}, in.Added...), in.Modified...) {
-		if isStoryFile(path) && !seen[path] {
+	for _, path := range in.StoryPaths {
+		if backlog.IsFile(path) && !seen[path] {
 			seen[path] = true
 			storyPaths = append(storyPaths, path)
 		}
@@ -87,30 +107,22 @@ func analyzeCommit(in Input) (Analysis, error) {
 	if len(storyPaths) == 0 {
 		return Analysis{
 			NeedsRefinement: false,
-			Reason:          "commit does not add or modify any file under " + storyDir,
+			Reason:          "commit does not add or modify any user story file under " + backlog.Dir,
 		}, nil
 	}
 
 	return Analysis{
 		NeedsRefinement: true,
-		Reason:          fmt.Sprintf("commit adds or modifies %d user story file(s) under %s", len(storyPaths), storyDir),
+		Reason:          fmt.Sprintf("commit adds or modifies %d user story file(s) under %s", len(storyPaths), backlog.Dir),
 		StoryPaths:      storyPaths,
 	}, nil
 }
 
-// isStoryFile reports whether path is a user story / backlog task file:
-// a markdown file directly under backlog/tasks/.
+// isStoryFile reports whether path is a backlog.md file: a markdown file
+// directly under backlog/tasks/. Whether it holds a user story or a task
+// is the shared backlog classification's decision.
 func isStoryFile(path string) bool {
-	if !strings.HasPrefix(path, storyDir) {
-		return false
-	}
-	rest := strings.TrimPrefix(path, storyDir)
-	// The file must be directly in backlog/tasks/ (no subdirectories)
-	// and have a .md extension.
-	if rest == "" || strings.Contains(rest, "/") {
-		return false
-	}
-	return strings.HasSuffix(rest, ".md")
+	return backlog.IsFile(path)
 }
 
 // FetchStoryInput is the input to the FetchStory activity.
@@ -385,7 +397,9 @@ func (a *Activities) OpenMergeRequest(ctx context.Context, in OpenMergeRequestIn
 			"repository", in.Repository, "head", in.Head, "base", in.Base)
 	}
 
-	mr, err := a.provider.CreateMergeRequest(ctx, in.Repository, in.Title, in.Description, in.Head, in.Base)
+	// Refinement merge requests are always regular MRs: drafts are for
+	// the implementation agent's incomplete attempts.
+	mr, err := a.provider.CreateMergeRequest(ctx, in.Repository, in.Title, in.Description, in.Head, in.Base, false)
 	if err != nil {
 		return MergeRequestInfo{}, fmt.Errorf("open merge request %s -> %s in %s: %w", in.Head, in.Base, in.Repository, err)
 	}

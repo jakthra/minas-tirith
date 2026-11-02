@@ -10,6 +10,13 @@
 // starter, runner, and event bridge are agent-agnostic; adding a new
 // agent type means implementing Template and registering it, without
 // touching worker startup or event wiring.
+//
+// A trigger either derives the workflow input from the event alone
+// (Trigger.Input) or, when the decision needs repository facts such as
+// file content, classifies the event with a shared activity first
+// (Trigger.Classify and Trigger.Route). The latter is how several agents
+// share one routing decision: each registers an activity trigger over the
+// same classification and starts only for its own kind of file.
 package worker
 
 import (
@@ -50,7 +57,33 @@ type Trigger struct {
 	// Input converts a dispatched event into the workflow input. Must not
 	// be nil.
 	Input func(ev event.Event) (any, bool)
+	// Classify, when set, makes this an activity trigger: before the
+	// workflow starts, the event bridge runs the named activity (registered
+	// by any template) and lets Route decide from its result whether the
+	// workflow starts and with which input. It is how a trigger decides on
+	// facts only the repository holds — file content, for instance — which
+	// the pure Input function cannot read. Exactly one of Input and
+	// Classify is set.
+	Classify string
+	// ClassifyResult returns a new pointer to an empty value of the
+	// classification activity's result type. The classifier decodes the
+	// activity's result into it, so Route receives the concrete type —
+	// across a Temporal boundary the raw result would otherwise decode
+	// into a generic map. Required for activity triggers; every trigger
+	// that names the same activity must declare the same result type,
+	// because one activity run (and one decoded result) is shared by all
+	// of them.
+	ClassifyResult func() any
+	// Route converts the event and the classification activity's result
+	// into the workflow input, reporting false when the workflow must not
+	// start. Required for activity triggers. The classification is the
+	// value ClassifyResult created, decoded.
+	Route func(ev event.Event, classification any) (any, bool)
 }
+
+// IsActivityTrigger reports whether the trigger classifies the event with
+// an activity before starting its workflow.
+func (tr Trigger) IsActivityTrigger() bool { return tr.Classify != "" }
 
 // Template is one agent type: the workflows and activities that implement
 // it, and the repository events that should start it.

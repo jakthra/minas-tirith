@@ -101,6 +101,9 @@ type MergeRequest struct {
 	Description string
 	// State is the MR state, e.g. "open" or "closed".
 	State string
+	// Draft reports whether the MR is a draft (work in progress) that
+	// is not ready to merge.
+	Draft bool
 	// Head is the source branch of the MR.
 	Head string
 	// Base is the target branch of the MR.
@@ -160,8 +163,11 @@ type Client interface {
 	Commit(ctx context.Context, repo, branch, message string, files []FileChange) (CommitResult, error)
 
 	// CreateMergeRequest opens a merge request from branch head to
-	// branch base and returns it.
-	CreateMergeRequest(ctx context.Context, repo, title, description, head, base string) (MergeRequest, error)
+	// branch base and returns it. A draft merge request is a work in
+	// progress that is not ready to merge; callers choose explicitly
+	// with draft, and the returned MergeRequest reports the provider's
+	// answer in its Draft field.
+	CreateMergeRequest(ctx context.Context, repo, title, description, head, base string, draft bool) (MergeRequest, error)
 
 	// GetMergeRequest returns the merge request details by number. It
 	// fails with ErrNotFound when the repository or merge request does

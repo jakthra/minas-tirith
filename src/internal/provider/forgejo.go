@@ -163,13 +163,14 @@ func (c *ForgejoClient) changeOperation(ctx context.Context, repo, branch string
 	return op, nil
 }
 
-// CreateMergeRequest implements Client.
-func (c *ForgejoClient) CreateMergeRequest(ctx context.Context, repo, title, description, head, base string) (MergeRequest, error) {
+// CreateMergeRequest implements Client. draft marks the merge request as
+// a draft (work in progress) on the provider.
+func (c *ForgejoClient) CreateMergeRequest(ctx context.Context, repo, title, description, head, base string, draft bool) (MergeRequest, error) {
 	path, err := repoPath(repo, "pulls")
 	if err != nil {
 		return MergeRequest{}, err
 	}
-	body := createPullRequestRequest{Title: title, Body: description, Head: head, Base: base}
+	body := createPullRequestRequest{Title: title, Body: description, Head: head, Base: base, Draft: draft}
 	var resp pullRequestResponse
 	if err := c.do(ctx, http.MethodPost, path, nil, body, &resp); err != nil {
 		return MergeRequest{}, err
@@ -409,6 +410,7 @@ type createPullRequestRequest struct {
 	Body  string `json:"body"`
 	Head  string `json:"head"`
 	Base  string `json:"base"`
+	Draft bool   `json:"draft"`
 }
 
 type pullRequestResponse struct {
@@ -416,6 +418,7 @@ type pullRequestResponse struct {
 	Title   string `json:"title"`
 	Body    string `json:"body"`
 	State   string `json:"state"`
+	Draft   bool   `json:"draft"`
 	HTMLURL string `json:"html_url"`
 	User    struct {
 		Login string `json:"login"`
@@ -434,6 +437,7 @@ func mergeRequestFrom(resp pullRequestResponse) MergeRequest {
 		Title:       resp.Title,
 		Description: resp.Body,
 		State:       resp.State,
+		Draft:       resp.Draft,
 		Head:        resp.Head.Ref,
 		Base:        resp.Base.Ref,
 		URL:         resp.HTMLURL,

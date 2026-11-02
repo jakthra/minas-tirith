@@ -426,39 +426,43 @@ func TestForgejoClientCommit(t *testing.T) {
 }
 
 func TestForgejoClientMergeRequests(t *testing.T) {
-	pull := func() map[string]any {
+	pull := func(draft bool) map[string]any {
 		return map[string]any{
 			"number":   7,
 			"title":    "Refine story 1",
 			"body":     "Implementation tickets",
 			"state":    "open",
+			"draft":    draft,
 			"html_url": "http://test/root/test/pulls/7",
 			"user":     map[string]any{"login": "agent"},
 			"head":     map[string]any{"ref": "agent/story-1"},
 			"base":     map[string]any{"ref": "main"},
 		}
 	}
-	wantMR := MergeRequest{
-		Number:      7,
-		Title:       "Refine story 1",
-		Description: "Implementation tickets",
-		State:       "open",
-		Head:        "agent/story-1",
-		Base:        "main",
-		URL:         "http://test/root/test/pulls/7",
-		Author:      "agent",
+	wantMR := func(draft bool) MergeRequest {
+		return MergeRequest{
+			Number:      7,
+			Title:       "Refine story 1",
+			Description: "Implementation tickets",
+			State:       "open",
+			Draft:       draft,
+			Head:        "agent/story-1",
+			Base:        "main",
+			URL:         "http://test/root/test/pulls/7",
+			Author:      "agent",
+		}
 	}
 
 	t.Run("create", func(t *testing.T) {
 		c, rec := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
-			respondJSON(w, http.StatusCreated, pull())
+			respondJSON(w, http.StatusCreated, pull(false))
 		})
-		mr, err := c.CreateMergeRequest(context.Background(), "root/test", "Refine story 1", "Implementation tickets", "agent/story-1", "main")
+		mr, err := c.CreateMergeRequest(context.Background(), "root/test", "Refine story 1", "Implementation tickets", "agent/story-1", "main", false)
 		if err != nil {
 			t.Fatalf("CreateMergeRequest: %v", err)
 		}
-		if mr != wantMR {
-			t.Errorf("mr = %+v, want %+v", mr, wantMR)
+		if mr != wantMR(false) {
+			t.Errorf("mr = %+v, want %+v", mr, wantMR(false))
 		}
 		got := rec.last()
 		if got.Method != http.MethodPost || got.Path != "/api/v1/repos/root/test/pulls" {
@@ -471,22 +475,59 @@ func TestForgejoClientMergeRequests(t *testing.T) {
 		if body.Title != "Refine story 1" || body.Body != "Implementation tickets" || body.Head != "agent/story-1" || body.Base != "main" {
 			t.Errorf("body = %+v, want title/description/head/base", body)
 		}
+		if body.Draft {
+			t.Errorf("body draft = true, want false for a regular merge request")
+		}
+	})
+
+	t.Run("create draft", func(t *testing.T) {
+		c, rec := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+			respondJSON(w, http.StatusCreated, pull(true))
+		})
+		mr, err := c.CreateMergeRequest(context.Background(), "root/test", "Refine story 1", "Implementation tickets", "agent/story-1", "main", true)
+		if err != nil {
+			t.Fatalf("CreateMergeRequest: %v", err)
+		}
+		if mr != wantMR(true) || !mr.Draft {
+			t.Errorf("mr = %+v, want draft merge request", mr)
+		}
+		got := rec.last()
+		var body createPullRequestRequest
+		if err := json.Unmarshal([]byte(got.Body), &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if !body.Draft {
+			t.Errorf("body = %s, want draft true", got.Body)
+		}
 	})
 
 	t.Run("get", func(t *testing.T) {
 		c, rec := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
-			respondJSON(w, http.StatusOK, pull())
+			respondJSON(w, http.StatusOK, pull(false))
 		})
 		mr, err := c.GetMergeRequest(context.Background(), "root/test", 7)
 		if err != nil {
 			t.Fatalf("GetMergeRequest: %v", err)
 		}
-		if mr != wantMR {
-			t.Errorf("mr = %+v, want %+v", mr, wantMR)
+		if mr != wantMR(false) {
+			t.Errorf("mr = %+v, want %+v", mr, wantMR(false))
 		}
 		got := rec.last()
 		if got.Method != http.MethodGet || got.Path != "/api/v1/repos/root/test/pulls/7" {
 			t.Errorf("request = %s %s, want GET pulls/7", got.Method, got.Path)
+		}
+	})
+
+	t.Run("get draft", func(t *testing.T) {
+		c, _ := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+			respondJSON(w, http.StatusOK, pull(true))
+		})
+		mr, err := c.GetMergeRequest(context.Background(), "root/test", 7)
+		if err != nil {
+			t.Fatalf("GetMergeRequest: %v", err)
+		}
+		if mr != wantMR(true) || !mr.Draft {
+			t.Errorf("mr = %+v, want draft merge request", mr)
 		}
 	})
 

@@ -45,6 +45,18 @@ func TestStarterRegisterResolvesTaskQueues(t *testing.T) {
 			t.Errorf("workflow %q resolved to %q, want %q", name, queue, want)
 		}
 	}
+	// Activity names resolve the same way: an activity runs on the queue
+	// of the template that registered it, so ExecuteActivity can reach
+	// the worker that polls for it. No worker polls the base queue.
+	for name, want := range map[string]string{"agentA.noop": "base-agentA", "agentB.noop": "base-agentB"} {
+		queue, ok := s.activityQueues[name]
+		if !ok {
+			t.Fatalf("activity %q did not resolve to a task queue", name)
+		}
+		if queue != want {
+			t.Errorf("activity %q resolved to %q, want %q", name, queue, want)
+		}
+	}
 }
 
 func TestStarterRegisterRejectsInvalidTemplates(t *testing.T) {
@@ -88,6 +100,20 @@ func TestStarterRegisterRejectsInvalidTemplates(t *testing.T) {
 			template:  fakeTemplate{name: "a", workflows: []Workflow{{Name: "w", Fn: noopWorkflow}}, triggers: []Trigger{{Kind: event.KindCommit, Workflow: "w"}}},
 			wantError: "trigger without input builder",
 		},
+		{
+			name: "activity trigger without route",
+			template: fakeTemplate{name: "a", workflows: []Workflow{{Name: "w", Fn: noopWorkflow}}, triggers: []Trigger{{
+				Kind: event.KindCommit, Workflow: "w", Classify: "act", ClassifyResult: func() any { return &struct{}{} },
+			}}},
+			wantError: "activity trigger without route",
+		},
+		{
+			name: "activity trigger without result factory",
+			template: fakeTemplate{name: "a", workflows: []Workflow{{Name: "w", Fn: noopWorkflow}}, triggers: []Trigger{{
+				Kind: event.KindCommit, Workflow: "w", Classify: "act", Route: passRoute,
+			}}},
+			wantError: "activity trigger without result factory",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -113,6 +139,64 @@ func TestStarterRegisterRejectsDuplicateTemplateAndWorkflow(t *testing.T) {
 	}
 	if err := s.Register(validTemplate("agentB", "workflowA")); err == nil {
 		t.Error("duplicate workflow name was accepted")
+	}
+	// A duplicate activity name is ambiguous — which queue would run it?
+	// — and is rejected the same way.
+	dupe := fakeTemplate{
+		name:       "agentB",
+		workflows:  []Workflow{{Name: "workflowB", Fn: noopWorkflow}},
+		activities: []Activity{{Name: "agentA.noop", Fn: noopActivity}},
+	}
+	if err := s.Register(dupe); err == nil {
+		t.Error("duplicate activity name was accepted")
+	}
+}
+
+func TestStarterActivityOptionsResolveQueue(t *testing.T) {
+	// The classification activity must run on the queue of the template
+	// that registered it: the runner's workers poll only those queues,
+	// so an activity sent to any other queue — the base queue included —
+	// never executes and the routing decision times out.
+	s := NewStarter(nil, "base")
+	if err := s.Register(validTemplate("agentA", "workflowA")); err != nil {
+		t.Fatal(err)
+	}
+
+	opts, err := s.activityOptions("agentA.noop")
+	if err != nil {
+		t.Fatalf("activityOptions: %v", err)
+	}
+	if opts.TaskQueue != "base-agentA" {
+		t.Errorf("activity task queue = %q, want base-agentA", opts.TaskQueue)
+	}
+	if opts.ScheduleToCloseTimeout != classifyTimeout {
+		t.Errorf("activity schedule-to-close = %v, want %v", opts.ScheduleToCloseTimeout, classifyTimeout)
+	}
+	if opts.ID == "" {
+		t.Error("activity ID is empty")
+	}
+
+	// An activity no registered template provides is a wiring bug: fail
+	// loudly instead of sending it to a queue nobody polls.
+	if _, err := s.activityOptions("unknown.activity"); err == nil {
+		t.Error("activityOptions for an unregistered activity was accepted")
+	}
+}
+
+func TestStarterExecuteActivityWithoutClient(t *testing.T) {
+	// The queue resolves before the client is used, so a missing client
+	// is reported as such rather than as a queue lookup failure.
+	s := NewStarter(nil, "base")
+	if err := s.Register(validTemplate("agentA", "workflowA")); err != nil {
+		t.Fatal(err)
+	}
+	err := s.ExecuteActivity(context.Background(), "agentA.noop", nil, &struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "no temporal client") {
+		t.Errorf("ExecuteActivity without client = %v, want the no-client error", err)
+	}
+	err = s.ExecuteActivity(context.Background(), "unknown.activity", nil, &struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "unregistered activity") {
+		t.Errorf("ExecuteActivity for an unregistered activity = %v, want the unregistered-activity error", err)
 	}
 }
 

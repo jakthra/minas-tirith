@@ -25,6 +25,12 @@ type Starter struct {
 	templates []Template
 	// queues maps workflow type name → task queue, filled by Register.
 	queues map[string]string
+	// activityQueues maps activity type name → task queue, filled by
+	// Register: an activity runs on the queue of the template that
+	// registered it, so ExecuteActivity can reach it. The runner's
+	// workers poll only those queues — no worker polls the base queue —
+	// so an activity sent anywhere else never executes.
+	activityQueues map[string]string
 }
 
 // NewStarter returns a starter that starts workflows on task queues
@@ -32,9 +38,10 @@ type Starter struct {
 // plus the template name.
 func NewStarter(c client.Client, baseQueue string) *Starter {
 	return &Starter{
-		client:    c,
-		baseQueue: baseQueue,
-		queues:    make(map[string]string),
+		client:         c,
+		baseQueue:      baseQueue,
+		queues:         make(map[string]string),
+		activityQueues: make(map[string]string),
 	}
 }
 
@@ -62,6 +69,9 @@ func (s *Starter) Register(t Template) error {
 		if a.Name == "" || a.Fn == nil {
 			return fmt.Errorf("worker: template %q has an activity without name or function", t.Name())
 		}
+		if _, taken := s.activityQueues[a.Name]; taken {
+			return fmt.Errorf("worker: activity %q of template %q is already registered", a.Name, t.Name())
+		}
 	}
 	for _, tr := range t.Triggers() {
 		if tr.Kind == "" {
@@ -70,13 +80,24 @@ func (s *Starter) Register(t Template) error {
 		if tr.Workflow == "" {
 			return fmt.Errorf("worker: template %q has a trigger without workflow", t.Name())
 		}
-		if tr.Input == nil {
+		switch {
+		case tr.IsActivityTrigger():
+			if tr.Route == nil {
+				return fmt.Errorf("worker: template %q has an activity trigger without route", t.Name())
+			}
+			if tr.ClassifyResult == nil {
+				return fmt.Errorf("worker: template %q has an activity trigger without result factory", t.Name())
+			}
+		case tr.Input == nil:
 			return fmt.Errorf("worker: template %q has a trigger without input builder", t.Name())
 		}
 	}
 	s.templates = append(s.templates, t)
 	for _, wf := range t.Workflows() {
 		s.queues[wf.Name] = s.TaskQueue(t.Name())
+	}
+	for _, a := range t.Activities() {
+		s.activityQueues[a.Name] = s.TaskQueue(t.Name())
 	}
 	return nil
 }

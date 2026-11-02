@@ -65,7 +65,7 @@ func seedRefinement(pf *provider.Fake) error {
 		ticket2Path: ticketFile(2, "Add login endpoint", ticket2Body),
 		ticket3Path: ticketFile(3, "Add login tests", ticket3Body),
 	})
-	_, err := pf.CreateMergeRequest(context.Background(), mrRepo, mrTitle, "refinement description", refineBranch, "main")
+	_, err := pf.CreateMergeRequest(context.Background(), mrRepo, mrTitle, "refinement description", refineBranch, "main", false)
 	return err
 }
 
@@ -404,7 +404,7 @@ func TestFindRefinementNotRefinement(t *testing.T) {
 	// A user MR that happens to carry a refinement-like title is not
 	// one of the agent's: the head branch decides.
 	pf := provider.NewFake(mrRepo)
-	if _, err := pf.CreateMergeRequest(t.Context(), mrRepo, mrTitle, "user MR", "feature/login", "main"); err != nil {
+	if _, err := pf.CreateMergeRequest(t.Context(), mrRepo, mrTitle, "user MR", "feature/login", "main", false); err != nil {
 		t.Fatalf("seed user MR: %v", err)
 	}
 	acts := NewActivities(pf, llm.NewFake())
@@ -1524,7 +1524,7 @@ func TestMrCommentWorkflowNotAgentMergeRequest(t *testing.T) {
 	// A user MR titled like a refinement: the trigger's title filter
 	// passes it, the workflow's branch check declines it.
 	pf := provider.NewFake(mrRepo)
-	if _, err := pf.CreateMergeRequest(t.Context(), mrRepo, mrTitle, "user MR", "feature/login", "main"); err != nil {
+	if _, err := pf.CreateMergeRequest(t.Context(), mrRepo, mrTitle, "user MR", "feature/login", "main", false); err != nil {
 		t.Fatalf("seed user MR: %v", err)
 	}
 	lf := llm.NewFake() // any scripted reply would fail the test if used

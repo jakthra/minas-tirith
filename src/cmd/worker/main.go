@@ -20,6 +20,7 @@ import (
 	"minas-tirith/internal/llm"
 	"minas-tirith/internal/provider"
 	"minas-tirith/internal/worker"
+	"minas-tirith/internal/worker/taskimplementation"
 	"minas-tirith/internal/worker/userstoryreview"
 )
 
@@ -75,6 +76,9 @@ func run(cfg *config.WorkerConfig) error {
 	// lifecycle management stay untouched.
 	runner := worker.NewRunner(tc, cfg.Temporal.TaskQueue)
 	if err := runner.Register(userstoryreview.Template(providerClient, llmClient)); err != nil {
+		return err
+	}
+	if err := runner.Register(taskimplementation.Template(providerClient, llmClient)); err != nil {
 		return err
 	}
 	if err := runner.Start(); err != nil {

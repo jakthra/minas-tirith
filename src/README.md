@@ -273,25 +273,92 @@ workflows; the worker executes them.
   "allow duplicate failed only" reuse policy: the same event dispatched
   twice starts the workflow once, while a workflow that failed can re-run.
   Duplicate starts are recognized and logged, not treated as errors.
+- **Backlog routing** (`internal/worker/backlog`): the one decision point
+  that classifies the backlog.md files a commit adds or modifies as a
+  task (`type: task`) or a user story (any other type, e.g. `type:
+  feature`), reading the file frontmatter at the commit. The id does not
+  decide: the backlog CLI names every item `TASK-NNN`, stories included,
+  so the frontmatter type is the only task-vs-story signal. The event
+  bridge runs the classification as the shared
+  `backlog.classifyCommit` activity before any workflow starts, and each
+  backlog agent registers an *activity trigger* (`Trigger.Classify` plus
+  `Trigger.Route`) that starts only for its own file kind. A task-only
+  commit starts the implementation agent, a story-only commit the review
+  agent, and a mixed commit starts each exactly once. Commits that touch
+  no backlog file, and commits on any agent branch (`refine/*` or
+  `implement/*`, see `backlog.IsAgentBranch`), start neither agent.
+  The activity crosses a Temporal boundary, so the boundary is typed on
+  both sides: it takes the dispatched `event.Event` (the type the bridge
+  serializes and the worker decodes), it runs on the task queue of the
+  template that registered it (no worker polls the base queue), and its
+  result is decoded into the `Trigger.ClassifyResult` value the trigger
+  declared before `Route` sees it.
 - **`userStoryReviewWorkflow`** (`internal/worker/userstoryreview`): the
   first template: the TASK-2 autonomous refinement agent. Commit events
-  on a watched repository start it with the commit's payload
-  (repository, branch, SHA, message, changed files). It detects user
-  stories (backlog.md files under `backlog/tasks/`), and for every
-  story the commit added or modified it fetches the story content,
+  that add or modify a user story start it with the commit's payload
+  (repository, branch, SHA, message, changed files) and the story paths
+  the shared classification found. For every story the commit added or
+  modified it fetches the story content,
   generates implementation tickets with the LLM, and opens a
   refinement merge request: a `refine/<story-slug>-<short-sha>` branch
   carrying the tickets as backlog.md files, proposed into the branch
   the commit landed on, with a description summarizing the refinement
-  and any questions the agent has for the user. Commits on the agent's
-  own `refine/*` branches are declined (the agent never refines its own
-  tickets). Comment handling is TASK-11; inline review (diff) comments,
+  and any questions the agent has for the user. Commits on any agent
+  branch are declined (the agent never refines its own tickets).
+  Comment handling is TASK-11; inline review (diff) comments,
   which Forgejo delivers only as review-submission events without
   positions, are resolved through the provider API (TASK-17). One review
   event processes every review comment no earlier run answered — oldest
   first, one response each — and any later comment or review event on
   the same merge request rescans for review comments that arrived
   without a webhook of their own (TASK-18).
+- **`taskImplementationWorkflow`** (`internal/worker/taskimplementation`):
+  the TASK-3 autonomous implementation agent. Commit events that add or
+  modify a backlog task start it with the commit's payload and the task
+  paths the shared backlog routing found, so a story-only commit never
+  starts it. For every task the workflow reads the task at the commit,
+  lists the repository, reads the files the task is likely to touch, and
+  asks the LLM to implement it with the versioned implementation prompt
+  (`prompt.go`, `ImplementationPromptVersion`). The model answers with a
+  structured outcome — a complete implementation, or a partial one with
+  its reason and open questions — and the proposed file changes, which
+  the workflow commits to an `implement/<task-slug>-<short-sha>` branch.
+  The result reports per task whether the implementation is complete or
+  partial, the branch, the changed files, and the reason when partial;
+  a partial implementation with no safe change still gets its branch, so
+  the merge request step (TASK-24) can open a draft MR and hand the task
+  back to the refinement agent.
+
+  The implementation agent end to end:
+  - **Trigger**: a push that adds or modifies a backlog task (`type:
+    task`) under `backlog/tasks/`. The shared backlog classification
+    decides this before the workflow starts; story-only commits start
+    the review agent instead, and commits on any agent branch
+    (`refine/*`, `implement/*`) start neither.
+  - **Prompt**: the versioned `ImplementationPrompt` — implement the
+    task against the repository code it is shown, respect every
+    acceptance criterion, and report either a `complete` outcome or a
+    `partial` one with a reason and open questions.
+  - **Branch**: the changes are committed to
+    `implement/<task-slug>-<short-sha>`, branched from the task commit.
+  - **MR**: a **complete** implementation opens a regular merge request
+    from the `implement/*` branch to the branch the task commit landed
+    on, titled `Implement <TASK-ID>: <title>` and linking the
+    implemented task in its description. A **partial** implementation
+    opens a **draft** MR carrying the work done so far, whose
+    description states why the task could not be fulfilled and lists
+    the open questions.
+  - **Draft/refiner fallback**: on a draft MR the agent also posts a
+    comment tagging the refiner agent (`@refiner`,
+    `RefinerAgentHandle`) with the open questions, so the refinement
+    agent's merge request comment loop (TASK-11) picks it up and runs a
+    refinement round on the MR's branch instead of leaving the task as
+    a dead end. A complete implementation never involves the refiner.
+  - **Result**: `Result.MergeRequestURL` carries the first opened MR,
+    and every `TaskImplementation.MergeRequest` reports its own MR
+    (number, title, URL, draft state, refiner comment); the workflow
+    logs the chosen outcome (complete/regular MR or partial/draft MR)
+    per task.
 
 Workflows can also be started manually, e.g. for testing:
 
@@ -299,6 +366,10 @@ Workflows can also be started manually, e.g. for testing:
 temporal workflow start --task-queue minas-tirith-userstoryreview \
   --type userStoryReviewWorkflow \
   --input '{"repository":"root/BeanieGenie","branch":"main","sha":"8ef0de217a18","message":"Refine story"}'
+
+temporal workflow start --task-queue minas-tirith-taskimplementation \
+  --type taskImplementationWorkflow \
+  --input '{"repository":"root/BeanieGenie","branch":"main","sha":"8ef0de217a18","task_paths":["backlog/tasks/task-19 - Implement login.md"]}'
 ```
 
 Execution is visible in the Temporal UI (http://localhost:8233 for the dev
@@ -316,8 +387,9 @@ the autonomous agents need:
 - **Write**: create a branch from an existing ref (`CreateBranch`), write
   one or more file changes as a single commit — creating or updating
   each file as needed (`Commit`).
-- **Merge requests**: open (`CreateMergeRequest`), fetch details
-  (`GetMergeRequest`), list and add conversation comments
+- **Merge requests**: open (`CreateMergeRequest`, as a draft or a regular
+  MR — the caller states which), fetch details
+  (`GetMergeRequest`, including the draft state), list and add conversation comments
   (`ListMergeRequestComments`, `AddMergeRequestComment`), and list the
   inline review comments with their file/line positions
   (`ListMergeRequestReviewComments` — Forgejo webhooks do not carry
@@ -417,6 +489,16 @@ internal/worker         Temporal execution layer: template registry, starter
   └─ userstoryreview    first agent template: userStoryReviewWorkflow
                         (TASK-2 refinement agent) + commit trigger + MR
                         comment loop (TASK-11, inline review comments TASK-17)
+  └─ backlog             shared routing: classifies a commit's backlog
+                        files as task or user story (frontmatter), one
+                        decision both agents route through
+  └─ taskimplementation  second agent template: taskImplementationWorkflow
+                        (TASK-3 implementation agent, TASK-19/23/24): a commit
+                        that adds or modifies a backlog task is read, the
+                        repository inspected, the task implemented with the
+                        LLM, the changes committed to an implement/* branch,
+                        and the MR opened — a regular MR when complete, a
+                        draft MR with a refiner hand-off when partial
 ```
 
 Detection goes through the pluggable `source.EventSource` abstraction: the

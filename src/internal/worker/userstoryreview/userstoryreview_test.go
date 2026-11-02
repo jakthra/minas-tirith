@@ -14,6 +14,7 @@ import (
 	"minas-tirith/internal/llm"
 	"minas-tirith/internal/provider"
 	"minas-tirith/internal/worker"
+	"minas-tirith/internal/worker/backlog"
 )
 
 // newTestEnv registers the template's workflow and activities with a test
@@ -99,62 +100,42 @@ func TestAnalyzeCommitDetectsStoryFiles(t *testing.T) {
 	tests := []struct {
 		name       string
 		branch     string
-		added      []string
-		modified   []string
-		removed    []string
+		storyPaths []string
 		wantRefine bool
 		wantPaths  []string
 	}{
 		{
-			name:       "added story file",
-			added:      []string{"backlog/tasks/task-1.md"},
-			wantRefine: true,
-			wantPaths:  []string{"backlog/tasks/task-1.md"},
-		},
-		{
-			name:       "modified story file",
-			modified:   []string{"backlog/tasks/task-1.md"},
+			name:       "classified story file",
+			storyPaths: []string{"backlog/tasks/task-1.md"},
 			wantRefine: true,
 			wantPaths:  []string{"backlog/tasks/task-1.md"},
 		},
 		{
 			name:       "multiple story files",
-			added:      []string{"backlog/tasks/task-1.md", "backlog/tasks/task-2.md"},
+			storyPaths: []string{"backlog/tasks/task-1.md", "backlog/tasks/task-2.md"},
 			wantRefine: true,
 			wantPaths:  []string{"backlog/tasks/task-1.md", "backlog/tasks/task-2.md"},
 		},
 		{
 			name:       "duplicate paths deduped",
-			added:      []string{"backlog/tasks/task-1.md"},
-			modified:   []string{"backlog/tasks/task-1.md"},
+			storyPaths: []string{"backlog/tasks/task-1.md", "backlog/tasks/task-1.md"},
 			wantRefine: true,
 			wantPaths:  []string{"backlog/tasks/task-1.md"},
 		},
 		{
-			name:       "non-story files only",
-			added:      []string{"src/main.go", "README.md"},
-			modified:   []string{"src/lib/util.go"},
+			name:       "no story files",
 			wantRefine: false,
 		},
 		{
-			name:       "removed story file is not refinement",
-			removed:    []string{"backlog/tasks/task-1.md"},
+			name:       "non-backlog paths are dropped",
+			storyPaths: []string{"src/main.go", "backlog/tasks/sub/file.md"},
 			wantRefine: false,
 		},
 		{
-			name:       "mixed story and non-story",
-			added:      []string{"src/main.go", "backlog/tasks/task-1.md"},
+			name:       "mixed backlog and non-backlog paths",
+			storyPaths: []string{"src/main.go", "backlog/tasks/task-1.md"},
 			wantRefine: true,
 			wantPaths:  []string{"backlog/tasks/task-1.md"},
-		},
-		{
-			name:       "nested path is not a story",
-			added:      []string{"backlog/tasks/sub/file.md"},
-			wantRefine: false,
-		},
-		{
-			name:       "no files",
-			wantRefine: false,
 		},
 		{
 			// Commits on the agent's own refine branches carry its
@@ -163,7 +144,15 @@ func TestAnalyzeCommitDetectsStoryFiles(t *testing.T) {
 			// guards manual workflow starts too.
 			name:       "agent commit on a refinement branch",
 			branch:     RefinementBranchPrefix + "task-009-track-watering-history-per-plant-8395b2548be1",
-			added:      []string{"backlog/tasks/task-010 - Create-watering-history-model.md"},
+			storyPaths: []string{"backlog/tasks/task-010 - Create-watering-history-model.md"},
+			wantRefine: false,
+		},
+		{
+			// Commits on the implementation agent's implement branches
+			// are agent work too: no backlog agent may act on them.
+			name:       "agent commit on an implementation branch",
+			branch:     backlog.ImplementationBranchPrefix + "task-019-8ef0de217a18",
+			storyPaths: []string{"backlog/tasks/task-2 - Autonomous refinement agent.md"},
 			wantRefine: false,
 		},
 	}
@@ -174,9 +163,7 @@ func TestAnalyzeCommitDetectsStoryFiles(t *testing.T) {
 			if tt.branch != "" {
 				in.Branch = tt.branch
 			}
-			in.Added = tt.added
-			in.Modified = tt.modified
-			in.Removed = tt.removed
+			in.StoryPaths = tt.storyPaths
 
 			analysis, err := analyzeCommit(in)
 			if err != nil {
@@ -572,9 +559,14 @@ func TestOpenMergeRequest(t *testing.T) {
 		t.Errorf("mr.Title = %q", mr.Title)
 	}
 
-	// The provider recorded the merge request.
-	if _, err := pf.GetMergeRequest(t.Context(), "root/BeanieGenie", 1); err != nil {
+	// The provider recorded the merge request, as a regular (non-draft)
+	// MR: refinement output is ready for review.
+	recorded, err := pf.GetMergeRequest(t.Context(), "root/BeanieGenie", 1)
+	if err != nil {
 		t.Errorf("merge request not recorded by the provider: %v", err)
+	}
+	if recorded.Draft {
+		t.Errorf("merge request draft = true, want a regular refinement MR")
 	}
 }
 
@@ -747,7 +739,7 @@ Add user login with JWT.
 	env := newTestEnvWithClients(t, pf, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -829,6 +821,9 @@ Add user login with JWT.
 	if mr.Head != branch || mr.Base != "main" {
 		t.Errorf("mr head/base = %q/%q, want %q/main", mr.Head, mr.Base, branch)
 	}
+	if mr.Draft {
+		t.Error("refinement merge request is a draft, want a regular MR")
+	}
 	for _, want := range []string{
 		"TASK-001: Add user login",
 		"**Add login endpoint**",
@@ -861,7 +856,7 @@ func TestWorkflowMultipleStoryFiles(t *testing.T) {
 	env := newTestEnvWithClients(t, pf, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md", "backlog/tasks/task-2.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md", "backlog/tasks/task-2.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -899,7 +894,7 @@ func TestWorkflowProviderAPIFailure(t *testing.T) {
 	env := newTestEnvWithClients(t, pf, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -924,7 +919,7 @@ func TestWorkflowLLMFailure(t *testing.T) {
 	env := newTestEnvWithClients(t, pf, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -953,7 +948,7 @@ type failMRClient struct {
 	provider.Client
 }
 
-func (failMRClient) CreateMergeRequest(context.Context, string, string, string, string, string) (provider.MergeRequest, error) {
+func (failMRClient) CreateMergeRequest(context.Context, string, string, string, string, string, bool) (provider.MergeRequest, error) {
 	return provider.MergeRequest{}, errors.New("forgejo refused the merge request")
 }
 
@@ -972,7 +967,7 @@ func TestWorkflowRefinementBranchFailure(t *testing.T) {
 	env := newTestEnvWithClients(t, failBranchClient{Client: pf}, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -1000,7 +995,7 @@ func TestWorkflowMergeRequestFailure(t *testing.T) {
 	env := newTestEnvWithClients(t, failMRClient{Client: pf}, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -1024,7 +1019,7 @@ func TestWorkflowZeroTicketsSkipsMR(t *testing.T) {
 	env := newTestEnvWithClients(t, pf, lf)
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 
 	env.ExecuteWorkflow(UserStoryReviewWorkflow, in)
 
@@ -1307,10 +1302,12 @@ func TestTemplate(t *testing.T) {
 		}
 	}
 	activities := tmpl.Activities()
-	if len(activities) != 11 {
-		t.Fatalf("activities = %d, want 11 (analyzeCommit, fetchStory, generateTickets, createRefinementBranch, commitTickets, openMergeRequest, findRefinement, collectTickets, interpretComment, applyTicketUpdates, postResponseComment)", len(activities))
+	if len(activities) != 13 {
+		t.Fatalf("activities = %d, want 13 (the shared backlog classification, the routing check, then analyzeCommit, fetchStory, generateTickets, createRefinementBranch, commitTickets, openMergeRequest, findRefinement, collectTickets, interpretComment, applyTicketUpdates, postResponseComment)", len(activities))
 	}
 	wantNames := []string{
+		backlog.ClassifyCommitActivity,
+		RefineCommitName,
 		AnalyzeCommitName,
 		FetchStoryName,
 		GenerateTicketsName,
@@ -1332,17 +1329,142 @@ func TestTemplate(t *testing.T) {
 		}
 	}
 
-	// The commit trigger starts the review workflow; the comment
+	// The commit trigger routes on the shared backlog classification and
+	// starts the review workflow only for user story files; the comment
 	// trigger starts the mr comment workflow.
 	triggers := tmpl.Triggers()
 	if len(triggers) != 2 {
 		t.Fatalf("triggers = %+v, want two", triggers)
 	}
-	if triggers[0].Kind != event.KindCommit || triggers[0].Workflow != WorkflowName || triggers[0].Input == nil {
+	if triggers[0].Kind != event.KindCommit || triggers[0].Workflow != WorkflowName {
 		t.Errorf("triggers[0] = %+v, want %q on %q", triggers[0], event.KindCommit, WorkflowName)
+	}
+	if !triggers[0].IsActivityTrigger() || triggers[0].Classify != backlog.ClassifyCommitActivity || triggers[0].Route == nil || triggers[0].ClassifyResult == nil {
+		t.Errorf("triggers[0] = %+v, want an activity trigger on %s", triggers[0], backlog.ClassifyCommitActivity)
 	}
 	if triggers[1].Kind != event.KindComment || triggers[1].Workflow != MrCommentWorkflowName || triggers[1].Input == nil {
 		t.Errorf("triggers[1] = %+v, want %q on %q", triggers[1], event.KindComment, MrCommentWorkflowName)
+	}
+}
+
+// --- Commit routing (AC1, AC2, AC3, AC4, AC5) ---
+
+// route runs the commit trigger's routing decision for an event and a
+// classification, the way the event bridge does: the classification is
+// the decoded value the trigger's ClassifyResult factory created.
+func route(t *testing.T, ev event.Event, c any) (Input, bool) {
+	t.Helper()
+	tr := Template(nil, nil).Triggers()[0]
+	got, ok := tr.Route(ev, c)
+	if !ok {
+		return Input{}, false
+	}
+	in, isInput := got.(Input)
+	if !isInput {
+		t.Fatalf("routed input type = %T, want Input", got)
+	}
+	return in, true
+}
+
+func TestRouteFromClassification(t *testing.T) {
+	story := "backlog/tasks/task-2 - Autonomous refinement agent.md"
+	task := "backlog/tasks/task-19 - Implement login.md"
+	commit := func(branch string, added []string) event.Event {
+		ev := event.Event{
+			Kind:       event.KindCommit,
+			Provider:   "forgejo",
+			Repository: "root/BeanieGenie",
+			Commit: &event.Commit{
+				SHA:    "8ef0de217a1823ebe9e4afffe7ff1dce0912f1c0",
+				Branch: branch,
+				Author: event.Person{Username: "root"},
+				Added:  added,
+			},
+		}
+		return ev
+	}
+
+	tests := []struct {
+		name           string
+		event          event.Event
+		classification any
+		want           bool
+		wantStories    []string
+	}{
+		{
+			name:           "added story is routed to the review agent",
+			event:          commit("main", []string{story}),
+			classification: &backlog.Classification{StoryPaths: []string{story}},
+			want:           true,
+			wantStories:    []string{story},
+		},
+		{
+			name:           "modified story is routed to the review agent",
+			event:          commit("main", nil),
+			classification: &backlog.Classification{StoryPaths: []string{story}},
+			want:           true,
+			wantStories:    []string{story},
+		},
+		{
+			name:           "task-only commit is not routed here",
+			event:          commit("main", []string{task}),
+			classification: &backlog.Classification{TaskPaths: []string{task}},
+			want:           false,
+		},
+		{
+			name:           "mixed commit is routed with only the story files",
+			event:          commit("main", []string{task, story}),
+			classification: &backlog.Classification{TaskPaths: []string{task}, StoryPaths: []string{story}},
+			want:           true,
+			wantStories:    []string{story},
+		},
+		{
+			name:           "non-backlog commit is not routed here",
+			event:          commit("main", []string{"src/main.go"}),
+			classification: &backlog.Classification{Reason: "no backlog files"},
+			want:           false,
+		},
+		{
+			name:           "commit on the agent's refinement branch is declined",
+			event:          commit(RefinementBranchPrefix+"task-009-track-watering-history-per-plant-8395b2548be1", []string{story}),
+			classification: &backlog.Classification{StoryPaths: []string{story}},
+			want:           false,
+		},
+		{
+			name:           "commit on the implementation agent's branch is declined too",
+			event:          commit(backlog.ImplementationBranchPrefix+"task-019-8ef0de217a18", []string{story}),
+			classification: &backlog.Classification{StoryPaths: []string{story}},
+			want:           false,
+		},
+		{
+			// The classification arrives as the decoded pointer the
+			// trigger's ClassifyResult factory declared; anything else
+			// is a wiring bug and is declined.
+			name:           "unexpected classification type is declined",
+			event:          commit("main", []string{story}),
+			classification: backlog.Classification{},
+			want:           false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in, ok := route(t, tt.event, tt.classification)
+			if ok != tt.want {
+				t.Fatalf("route ok = %v, want %v", ok, tt.want)
+			}
+			if !ok {
+				return
+			}
+			if strings.Join(in.StoryPaths, ",") != strings.Join(tt.wantStories, ",") {
+				t.Errorf("story paths = %v, want %v", in.StoryPaths, tt.wantStories)
+			}
+			if in.SHA != tt.event.Commit.SHA || in.Branch != tt.event.Commit.Branch {
+				t.Errorf("input context = (%q, %q)", in.Branch, in.SHA)
+			}
+			if err := in.Validate(); err != nil {
+				t.Errorf("Validate() = %v", err)
+			}
+		})
 	}
 }
 
@@ -1359,7 +1481,7 @@ func TestAnalyzeCommitActivityEnv(t *testing.T) {
 	env.RegisterActivityWithOptions(acts.AnalyzeCommit, activity.RegisterOptions{Name: AnalyzeCommitName})
 
 	in := validInput()
-	in.Added = []string{"backlog/tasks/task-1.md"}
+	in.StoryPaths = []string{"backlog/tasks/task-1.md"}
 	encoded, err := env.ExecuteActivity(acts.AnalyzeCommit, in)
 	if err != nil {
 		t.Fatalf("AnalyzeCommit failed: %v", err)

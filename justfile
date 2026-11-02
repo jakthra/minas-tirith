@@ -35,3 +35,7 @@ forgejo-up:
 # Commit a sample user story to the template repository and push it to the dev Forgejo.
 commit-sample-story:
     ./scripts/commit-sample-story.sh
+
+# Commit a sample implementation task to the template repository and push it to the dev Forgejo.
+commit-sample-task:
+    ./scripts/commit-sample-task.sh

@@ -17,6 +17,8 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 	"gopkg.in/yaml.v3"
+
+	"minas-tirith/internal/worker/backlog"
 )
 
 // WorkflowName is the Temporal workflow type name for the user story
@@ -24,12 +26,16 @@ import (
 const WorkflowName = "userStoryReviewWorkflow"
 
 // RefinementBranchPrefix prefixes every refinement branch the agent
-// creates (see RefinementBranchName). Commits on these branches are the
-// agent's own work, never new user stories to refine.
-const RefinementBranchPrefix = "refine/"
+// creates (see RefinementBranchName). The agent-branch rules themselves
+// live in the shared backlog package (see backlog.IsAgentBranch).
+const RefinementBranchPrefix = backlog.RefinementBranchPrefix
 
 // Activity type names.
 const (
+	// RefineCommitName is the Temporal activity type name for the
+	// routing check that declines commits the review agent must not act
+	// on (its own refinement branches, no user story files).
+	RefineCommitName = "userStoryReview.refineCommit"
 	// AnalyzeCommitName is the Temporal activity type name for the commit
 	// analysis activity.
 	AnalyzeCommitName = "userStoryReview.analyzeCommit"
@@ -53,7 +59,8 @@ const (
 )
 
 // Input is the commit event payload the workflow receives: which
-// repository and branch the commit landed on, and the commit itself.
+// repository and branch the commit landed on, the commit itself, and the
+// user story files the shared backlog classification found in it.
 type Input struct {
 	Provider   string   `json:"provider"`   // event source provider, e.g. "forgejo"
 	Project    string   `json:"project"`    // watched project name, e.g. "BeanieGenie"
@@ -66,6 +73,11 @@ type Input struct {
 	Added      []string `json:"added,omitempty"`
 	Removed    []string `json:"removed,omitempty"`
 	Modified   []string `json:"modified,omitempty"`
+	// StoryPaths lists the user story files the commit added or modified,
+	// as classified by the shared backlog classification before the
+	// workflow started. The workflow re-verifies them (agent branches,
+	// backlog paths) before acting on them.
+	StoryPaths []string `json:"story_paths,omitempty"`
 }
 
 // Validate reports whether the payload identifies a reviewable commit.
@@ -384,17 +396,7 @@ func parseStoryMeta(content string) storyMeta {
 // the lines between the opening and closing --- lines. It reports
 // false when the content has no frontmatter.
 func frontmatterBlock(content string) (string, bool) {
-	s := strings.TrimLeft(content, " \t\r\n")
-	lines := strings.Split(s, "\n")
-	if len(lines) < 2 || strings.TrimRight(lines[0], "\r") != "---" {
-		return "", false
-	}
-	for i := 1; i < len(lines); i++ {
-		if strings.TrimRight(lines[i], "\r") == "---" {
-			return strings.Join(lines[1:i], "\n"), true
-		}
-	}
-	return "", false
+	return backlog.FrontmatterBlock(content)
 }
 
 // mrContent carries everything the refinement merge request title and

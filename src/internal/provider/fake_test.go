@@ -151,12 +151,15 @@ func TestFakeMergeRequestFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mr, err := f.CreateMergeRequest(ctx(), "root/BeanieGenie", "Refine story", "Tickets inside", "agent/story-1", "main")
+	mr, err := f.CreateMergeRequest(ctx(), "root/BeanieGenie", "Refine story", "Tickets inside", "agent/story-1", "main", false)
 	if err != nil {
 		t.Fatalf("CreateMergeRequest: %v", err)
 	}
 	if mr.Number == 0 || mr.State != "open" || mr.Head != "agent/story-1" || mr.Base != "main" {
 		t.Errorf("mr = %+v, want open MR head->base", mr)
+	}
+	if mr.Draft {
+		t.Errorf("mr = %+v, want a regular (non-draft) merge request", mr)
 	}
 
 	t.Run("get merge request", func(t *testing.T) {
@@ -166,6 +169,34 @@ func TestFakeMergeRequestFlow(t *testing.T) {
 		}
 		if got != mr {
 			t.Errorf("mr = %+v, want %+v", got, mr)
+		}
+	})
+
+	t.Run("draft merge request", func(t *testing.T) {
+		draft, err := f.CreateMergeRequest(ctx(), "root/BeanieGenie", "Incomplete", "Could not finish", "agent/story-2", "main", true)
+		if err != nil {
+			t.Fatalf("CreateMergeRequest: %v", err)
+		}
+		if !draft.Draft {
+			t.Errorf("mr = %+v, want draft merge request", draft)
+		}
+		if draft.Number == mr.Number {
+			t.Errorf("draft number = %d, want a new merge request", draft.Number)
+		}
+		got, err := f.GetMergeRequest(ctx(), "root/BeanieGenie", draft.Number)
+		if err != nil {
+			t.Fatalf("GetMergeRequest: %v", err)
+		}
+		if got != draft || !got.Draft {
+			t.Errorf("mr = %+v, want the recorded draft %+v", got, draft)
+		}
+		// The regular MR keeps its own state.
+		regular, err := f.GetMergeRequest(ctx(), "root/BeanieGenie", mr.Number)
+		if err != nil {
+			t.Fatalf("GetMergeRequest: %v", err)
+		}
+		if regular.Draft {
+			t.Errorf("mr = %+v, want the regular MR to stay non-draft", regular)
 		}
 	})
 
@@ -226,7 +257,7 @@ func TestFakeErr(t *testing.T) {
 	if _, err := f.Commit(ctx, "root/BeanieGenie", "main", "m", []FileChange{{Path: "a", Content: []byte("x")}}); !errors.Is(err, injected) {
 		t.Errorf("Commit error = %v, want injected", err)
 	}
-	if _, err := f.CreateMergeRequest(ctx, "root/BeanieGenie", "t", "d", "h", "main"); !errors.Is(err, injected) {
+	if _, err := f.CreateMergeRequest(ctx, "root/BeanieGenie", "t", "d", "h", "main", false); !errors.Is(err, injected) {
 		t.Errorf("CreateMergeRequest error = %v, want injected", err)
 	}
 	if _, err := f.GetMergeRequest(ctx, "root/BeanieGenie", 1); !errors.Is(err, injected) {

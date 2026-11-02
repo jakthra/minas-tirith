@@ -17,6 +17,7 @@ import (
 	"minas-tirith/internal/event"
 	"minas-tirith/internal/server"
 	"minas-tirith/internal/worker"
+	"minas-tirith/internal/worker/taskimplementation"
 	"minas-tirith/internal/worker/userstoryreview"
 )
 
@@ -63,6 +64,10 @@ func main() {
 	// are validated for registration but never called here.
 	starter := worker.NewStarter(tc, cfg.Temporal.TaskQueue)
 	if err := starter.Register(userstoryreview.Template(nil, nil)); err != nil {
+		slog.Error("failed to register agent template", "error", err)
+		os.Exit(1)
+	}
+	if err := starter.Register(taskimplementation.Template(nil, nil)); err != nil {
 		slog.Error("failed to register agent template", "error", err)
 		os.Exit(1)
 	}

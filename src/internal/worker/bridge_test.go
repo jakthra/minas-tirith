@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,87 @@ func (f *fakeStarter) recorded() []start {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]start(nil), f.starts...)
+}
+
+// classifyCall is one recorded classification activity execution.
+type classifyCall struct {
+	activity string
+	arg      any
+}
+
+// fakeClassifier records ExecuteActivity calls and decodes a scripted
+// result or error into the caller's pointer, crossing the same
+// serialization boundary the Temporal SDK puts between an activity and
+// its caller.
+type fakeClassifier struct {
+	mu     sync.Mutex
+	calls  []classifyCall
+	result any
+	err    error
+}
+
+func (f *fakeClassifier) ExecuteActivity(ctx context.Context, activity string, arg any, result any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, classifyCall{activity: activity, arg: arg})
+	if f.err != nil {
+		return f.err
+	}
+	data, err := json.Marshal(f.result)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, result)
+}
+
+func (f *fakeClassifier) recorded() []classifyCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]classifyCall(nil), f.calls...)
+}
+
+// classifyingStarter is a starter that also classifies activities, the
+// way *Starter and *Runner do.
+type classifyingStarter struct {
+	*fakeStarter
+	classifier *fakeClassifier
+}
+
+func (c classifyingStarter) ExecuteActivity(ctx context.Context, activity string, arg any, result any) error {
+	return c.classifier.ExecuteActivity(ctx, activity, arg, result)
+}
+
+// classification is the shape a routing trigger's Route function reads
+// from the classification activity's result. The json tags matter: the
+// fakes cross the same serialization boundary the real SDK does, so the
+// result survives only what the tags preserve.
+type classification struct {
+	Tasks   []string `json:"tasks"`
+	Stories []string `json:"stories"`
+}
+
+// activityTrigger mirrors an agent's activity trigger: it starts the
+// workflow only when the classification assigned it at least one file.
+func activityTrigger(workflow string, pick func(classification) []string) Trigger {
+	return Trigger{
+		Kind:     event.KindCommit,
+		Workflow: workflow,
+		Classify: "backlog.classifyCommit",
+		ClassifyResult: func() any {
+			return &classification{}
+		},
+		Route: func(ev event.Event, result any) (any, bool) {
+			c, ok := result.(*classification)
+			if !ok {
+				return nil, false
+			}
+			paths := pick(*c)
+			if len(paths) == 0 {
+				return nil, false
+			}
+			return paths, true
+		},
+	}
 }
 
 func commitEvent() event.Event {
@@ -205,6 +287,178 @@ func TestBridgeSubscribesToDispatcher(t *testing.T) {
 	got := starter.recorded()[0]
 	if got.workflow != "userStoryReviewWorkflow" {
 		t.Errorf("workflow = %q, want userStoryReviewWorkflow", got.workflow)
+	}
+}
+
+// --- Activity triggers: content-based routing before the workflow starts ---
+
+func TestHandleEventActivityTriggerStartsWhenRouted(t *testing.T) {
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{result: classification{Tasks: []string{"backlog/tasks/task-19 - Implement login.md"}}}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier},
+		[]Trigger{activityTrigger("taskImplementationWorkflow", func(c classification) []string { return c.Tasks })})
+
+	if err := bridge.HandleEvent(context.Background(), commitEvent()); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+
+	calls := classifier.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("classification calls = %d, want 1", len(calls))
+	}
+	if calls[0].activity != "backlog.classifyCommit" {
+		t.Errorf("activity = %q, want backlog.classifyCommit", calls[0].activity)
+	}
+	if ev, ok := calls[0].arg.(event.Event); !ok || ev.Commit == nil || ev.Commit.SHA != "8ef0de217a1823ebe9e4afffe7ff1dce0912f1c0" {
+		t.Errorf("activity arg = %#v, want the dispatched event", calls[0].arg)
+	}
+
+	got := starter.recorded()
+	if len(got) != 1 {
+		t.Fatalf("started %d workflows, want 1", len(got))
+	}
+	if got[0].workflow != "taskImplementationWorkflow" {
+		t.Errorf("workflow = %q, want taskImplementationWorkflow", got[0].workflow)
+	}
+	paths, ok := got[0].input.([]string)
+	if !ok || len(paths) != 1 || paths[0] != "backlog/tasks/task-19 - Implement login.md" {
+		t.Errorf("input = %#v, want the routed task paths", got[0].input)
+	}
+}
+
+func TestHandleEventActivityTriggerSkipsWhenNotRouted(t *testing.T) {
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{result: classification{Stories: []string{"backlog/tasks/task-2 - Story.md"}}}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier},
+		[]Trigger{activityTrigger("taskImplementationWorkflow", func(c classification) []string { return c.Tasks })})
+
+	if err := bridge.HandleEvent(context.Background(), commitEvent()); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	if got := starter.recorded(); len(got) != 0 {
+		t.Errorf("started %d workflows for a commit routed elsewhere, want 0", len(got))
+	}
+}
+
+func TestHandleEventActivityTriggersShareOneClassification(t *testing.T) {
+	// Two agents route on the same classification activity: it runs once
+	// per event, and each agent starts (once) only for its own files.
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{result: classification{
+		Tasks:   []string{"backlog/tasks/task-19 - Implement login.md"},
+		Stories: []string{"backlog/tasks/task-2 - Story.md"},
+	}}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier}, []Trigger{
+		activityTrigger("userStoryReviewWorkflow", func(c classification) []string { return c.Stories }),
+		activityTrigger("taskImplementationWorkflow", func(c classification) []string { return c.Tasks }),
+	})
+
+	if err := bridge.HandleEvent(context.Background(), commitEvent()); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	if calls := classifier.recorded(); len(calls) != 1 {
+		t.Errorf("classification calls = %d, want 1 (shared by both triggers)", len(calls))
+	}
+	got := starter.recorded()
+	if len(got) != 2 {
+		t.Fatalf("started %d workflows, want 2 (one per agent)", len(got))
+	}
+	if got[0].workflow != "userStoryReviewWorkflow" || got[1].workflow != "taskImplementationWorkflow" {
+		t.Errorf("workflows = %q, %q, want one start each", got[0].workflow, got[1].workflow)
+	}
+}
+
+func TestHandleEventActivityTriggerClassificationFailure(t *testing.T) {
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{err: context.DeadlineExceeded}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier}, []Trigger{
+		activityTrigger("userStoryReviewWorkflow", func(c classification) []string { return c.Stories }),
+		activityTrigger("taskImplementationWorkflow", func(c classification) []string { return c.Tasks }),
+	})
+
+	err := bridge.HandleEvent(context.Background(), commitEvent())
+	if err == nil {
+		t.Fatal("HandleEvent(classification failure) = nil, want an error")
+	}
+	if got := starter.recorded(); len(got) != 0 {
+		t.Errorf("started %d workflows after a failed classification, want 0", len(got))
+	}
+	// The shared classification was attempted once, not once per trigger.
+	if calls := classifier.recorded(); len(calls) != 1 {
+		t.Errorf("classification calls = %d, want 1", len(calls))
+	}
+}
+
+func TestHandleEventActivityTriggerWithoutClassifier(t *testing.T) {
+	// A bridge built on a starter that cannot classify cannot evaluate
+	// activity triggers: it reports the error and starts nothing.
+	starter := &fakeStarter{}
+	bridge := NewEventBridge(starter,
+		[]Trigger{activityTrigger("taskImplementationWorkflow", func(c classification) []string { return c.Tasks })})
+
+	if err := bridge.HandleEvent(context.Background(), commitEvent()); err == nil {
+		t.Fatal("HandleEvent without a classifier = nil, want an error")
+	}
+	if got := starter.recorded(); len(got) != 0 {
+		t.Errorf("started %d workflows without a classifier, want 0", len(got))
+	}
+}
+
+func TestHandleEventActivityTriggerWithoutRoute(t *testing.T) {
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{result: classification{Tasks: []string{"x"}}}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier},
+		[]Trigger{{Kind: event.KindCommit, Workflow: "w", Classify: "backlog.classifyCommit"}})
+
+	if err := bridge.HandleEvent(context.Background(), commitEvent()); err == nil {
+		t.Fatal("HandleEvent(activity trigger without route) = nil, want an error")
+	}
+	if got := starter.recorded(); len(got) != 0 {
+		t.Errorf("started %d workflows, want 0", len(got))
+	}
+}
+
+func TestHandleEventActivityTriggerWithoutResultFactory(t *testing.T) {
+	// An activity trigger must declare the result type its Route reads:
+	// across the Temporal boundary the result arrives as a payload, and
+	// without the factory there is nothing to decode it into. The
+	// trigger fails loudly instead of routing on an undecodable value.
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{result: classification{Tasks: []string{"x"}}}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier},
+		[]Trigger{{
+			Kind:     event.KindCommit,
+			Workflow: "w",
+			Classify: "backlog.classifyCommit",
+			Route:    func(ev event.Event, result any) (any, bool) { return result, true },
+		}})
+
+	if err := bridge.HandleEvent(context.Background(), commitEvent()); err == nil {
+		t.Fatal("HandleEvent(activity trigger without result factory) = nil, want an error")
+	}
+	if got := starter.recorded(); len(got) != 0 {
+		t.Errorf("started %d workflows, want 0", len(got))
+	}
+	// The factory check precedes the activity: nothing ran.
+	if calls := classifier.recorded(); len(calls) != 0 {
+		t.Errorf("classification calls = %d, want 0", len(calls))
+	}
+}
+
+func TestHandleEventActivityTriggerIgnoresOtherKinds(t *testing.T) {
+	starter := &fakeStarter{}
+	classifier := &fakeClassifier{result: classification{Tasks: []string{"x"}}}
+	bridge := NewEventBridge(classifyingStarter{fakeStarter: starter, classifier: classifier},
+		[]Trigger{activityTrigger("taskImplementationWorkflow", func(c classification) []string { return c.Tasks })})
+
+	if err := bridge.HandleEvent(context.Background(), commentEvent()); err != nil {
+		t.Errorf("HandleEvent(comment event): %v", err)
+	}
+	if calls := classifier.recorded(); len(calls) != 0 {
+		t.Errorf("classification calls = %d for a non-matching event, want 0", len(calls))
+	}
+	if got := starter.recorded(); len(got) != 0 {
+		t.Errorf("started %d workflows, want 0", len(got))
 	}
 }
 

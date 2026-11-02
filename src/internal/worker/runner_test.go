@@ -132,6 +132,20 @@ func TestRegisterRejectsInvalidTemplates(t *testing.T) {
 			template:  fakeTemplate{name: "a", workflows: []Workflow{{Name: "w", Fn: noopWorkflow}}, triggers: []Trigger{{Kind: event.KindCommit, Workflow: "w"}}},
 			wantError: "trigger without input builder",
 		},
+		{
+			name: "activity trigger without route",
+			template: fakeTemplate{name: "a", workflows: []Workflow{{Name: "w", Fn: noopWorkflow}}, triggers: []Trigger{{
+				Kind: event.KindCommit, Workflow: "w", Classify: "act", ClassifyResult: func() any { return &struct{}{} },
+			}}},
+			wantError: "activity trigger without route",
+		},
+		{
+			name: "activity trigger without result factory",
+			template: fakeTemplate{name: "a", workflows: []Workflow{{Name: "w", Fn: noopWorkflow}}, triggers: []Trigger{{
+				Kind: event.KindCommit, Workflow: "w", Classify: "act", Route: passRoute,
+			}}},
+			wantError: "activity trigger without result factory",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -288,3 +302,7 @@ func TestStopWithoutStart(t *testing.T) {
 
 // passInput is a trivial input builder for tests in this package.
 func passInput(ev event.Event) (any, bool) { return ev, true }
+
+// passRoute is a trivial route for activity triggers in tests in this
+// package.
+func passRoute(ev event.Event, result any) (any, bool) { return result, true }
