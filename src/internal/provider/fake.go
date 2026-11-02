@@ -31,13 +31,14 @@ type Fake struct {
 
 // fakeRepo is one repository held by a Fake.
 type fakeRepo struct {
-	defaultBranch string
-	branches      map[string]*fakeBranch
-	shas          map[string]*fakeBranch // commit SHA -> branch state at that commit
-	mergeRequests map[int64]MergeRequest
-	comments      map[int64][]Comment
-	nextNumber    int64
-	nextSHA       int
+	defaultBranch  string
+	branches       map[string]*fakeBranch
+	shas           map[string]*fakeBranch // commit SHA -> branch state at that commit
+	mergeRequests  map[int64]MergeRequest
+	comments       map[int64][]Comment
+	reviewComments map[int64][]Comment
+	nextNumber     int64
+	nextSHA        int
 }
 
 // fakeBranch is one branch's state: its name, head SHA, and files.
@@ -67,11 +68,12 @@ func (f *Fake) repo(repo string) *fakeRepo {
 	r, ok := f.repos[repo]
 	if !ok {
 		r = &fakeRepo{
-			defaultBranch: "main",
-			branches:      map[string]*fakeBranch{"main": newFakeBranch("main")},
-			shas:          map[string]*fakeBranch{},
-			mergeRequests: map[int64]MergeRequest{},
-			comments:      map[int64][]Comment{},
+			defaultBranch:  "main",
+			branches:       map[string]*fakeBranch{"main": newFakeBranch("main")},
+			shas:           map[string]*fakeBranch{},
+			mergeRequests:  map[int64]MergeRequest{},
+			comments:       map[int64][]Comment{},
+			reviewComments: map[int64][]Comment{},
 		}
 		f.repos[repo] = r
 	}
@@ -276,6 +278,50 @@ func (f *Fake) ListMergeRequestComments(_ context.Context, repo string, number i
 	out := make([]Comment, len(comments))
 	copy(out, comments)
 	return out, nil
+}
+
+// ListMergeRequestReviewComments implements Client.
+func (f *Fake) ListMergeRequestReviewComments(_ context.Context, repo string, number int64) ([]Comment, error) {
+	if err := f.op(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.repos[repo]
+	if !ok {
+		return nil, fmt.Errorf("%w: repository %s", ErrNotFound, repo)
+	}
+	comments := r.reviewComments[number]
+	out := make([]Comment, len(comments))
+	copy(out, comments)
+	return out, nil
+}
+
+// AddMergeRequestReviewComment seeds one inline review comment on a merge
+// request, the way a provider review carries it: with the commented file's
+// path and line. Tests use it to arrange inline feedback.
+func (f *Fake) AddMergeRequestReviewComment(_ context.Context, repo string, number int64, body, path string, line int) (Comment, error) {
+	if err := f.op(); err != nil {
+		return Comment{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.repos[repo]
+	if !ok {
+		return Comment{}, fmt.Errorf("%w: repository %s", ErrNotFound, repo)
+	}
+	if _, ok := r.mergeRequests[number]; !ok {
+		return Comment{}, fmt.Errorf("%w: merge request %d in %s", ErrNotFound, number, repo)
+	}
+	comment := Comment{
+		ID:     int64(1000 + len(r.reviewComments[number]) + 1),
+		Body:   body,
+		Author: "fake",
+		Path:   path,
+		Line:   line,
+	}
+	r.reviewComments[number] = append(r.reviewComments[number], comment)
+	return comment, nil
 }
 
 // AddMergeRequestComment implements Client.

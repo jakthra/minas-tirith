@@ -69,13 +69,20 @@ type CommentPosition struct {
 
 // Comment holds the details of a merge request comment.
 type Comment struct {
-	ID        int64             `json:"id"`
-	Body      string            `json:"body,omitempty"`
-	URL       string            `json:"url,omitempty"`
-	Author    Person            `json:"author,omitempty"`
-	CreatedAt string            `json:"created_at,omitempty"` // provider-formatted comment time
-	MR        *MergeRequest     `json:"mr,omitempty"`
-	Position  *CommentPosition  `json:"position,omitempty"` // inline location, when the provider reports one
+	ID        int64            `json:"id"`
+	Body      string           `json:"body,omitempty"`
+	URL       string           `json:"url,omitempty"`
+	Author    Person           `json:"author,omitempty"`
+	CreatedAt string           `json:"created_at,omitempty"` // provider-formatted comment time
+	MR        *MergeRequest    `json:"mr,omitempty"`
+	Position  *CommentPosition `json:"position,omitempty"` // inline location, when the provider reports one
+	// Review marks a review-submission delivery (e.g. Forgejo's
+	// pull_request_comment/approved/rejected events): the payload
+	// describes the review, not one comment, so ID may be a synthetic
+	// stand-in and Body may be empty — the review's actual comments
+	// (with their inline positions) are resolved through the provider
+	// API by consumers.
+	Review bool `json:"review,omitempty"`
 }
 
 // Event is a provider-agnostic repository event. Exactly one of Commit or

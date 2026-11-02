@@ -187,8 +187,15 @@ A `GET /healthz` endpoint reports liveness.
    - Method: `POST`, Content type: `application/json`
    - Secret: the repository's `secret` as declared in the watched config
      file
-   - Trigger on: **Push events** and **Pull request comment** (issue comment
-     events carry merge request comments)
+   - Trigger on: **Push events**, **Issue comments** and **Pull request
+     comments** (these carry merge request conversation comments), and
+     **Pull request reviews** (`pull_request_review_comment` /
+     `pull_request_review_approved` / `pull_request_review_rejected`).
+     The review events are what carries inline diff comments: Forgejo sends
+     no per-comment webhook for comments left during a review, and the
+     review payload itself carries neither the comment bodies nor their
+     file/line positions (forgejo#7935/#7966), so the agent resolves them
+     through the pulls reviews API (`ListMergeRequestReviewComments`).
 
    `169.254.1.2` is the address the Forgejo container uses to reach services
    on the host when running under rootless podman (pasta networking). If
@@ -203,7 +210,9 @@ A `GET /healthz` endpoint reports liveness.
      -H "Content-Type: application/json" \
      http://localhost:3000/api/v1/repos/root/BeanieGenie/hooks -d '{
        "type": "gitea", "active": true,
-       "events": ["push", "pull_request_comment", "issue_comment"],
+       "events": ["push", "issue_comment", "pull_request_comment",
+                  "pull_request_review_comment", "pull_request_review_approved",
+                  "pull_request_review_rejected"],
        "config": {"url": "http://169.254.1.2:9797/v1/BeanieGenie/webhooks/forgejo",
                    "content_type": "json", "secret": "s3cret"}
      }'
@@ -276,7 +285,13 @@ workflows; the worker executes them.
   the commit landed on, with a description summarizing the refinement
   and any questions the agent has for the user. Commits on the agent's
   own `refine/*` branches are declined (the agent never refines its own
-  tickets). Comment handling is TASK-11.
+  tickets). Comment handling is TASK-11; inline review (diff) comments,
+  which Forgejo delivers only as review-submission events without
+  positions, are resolved through the provider API (TASK-17). One review
+  event processes every review comment no earlier run answered — oldest
+  first, one response each — and any later comment or review event on
+  the same merge request rescans for review comments that arrived
+  without a webhook of their own (TASK-18).
 
 Workflows can also be started manually, e.g. for testing:
 
@@ -302,8 +317,11 @@ the autonomous agents need:
   one or more file changes as a single commit — creating or updating
   each file as needed (`Commit`).
 - **Merge requests**: open (`CreateMergeRequest`), fetch details
-  (`GetMergeRequest`), list and add comments
-  (`ListMergeRequestComments`, `AddMergeRequestComment`).
+  (`GetMergeRequest`), list and add conversation comments
+  (`ListMergeRequestComments`, `AddMergeRequestComment`), and list the
+  inline review comments with their file/line positions
+  (`ListMergeRequestReviewComments` — Forgejo webhooks do not carry
+  inline positions, so the comment loop resolves them through this).
 
 Repositories are addressed by full name (`root/BeanieGenie`); refs are
 branch names or commit SHAs, an empty ref meaning the default branch.
@@ -382,7 +400,7 @@ internal/source         EventSource abstraction (Start → routes + dispatcher)
 internal/source/webhook the webhook event source: route, per-repo auth via the
                         config store, dedupe, dispatch
   └─ forgejo.go         Forgejo/Gitea provider adapter: HMAC-SHA256 verification,
-                        push + issue-comment parsing
+                        push + issue-comment + pull-request-review parsing
 internal/server         wires sources, mux, HTTP server, graceful shutdown
 internal/provider      Forgejo/Gitea repository API client behind the Client
                         interface (fetch files, list directories, create
@@ -396,8 +414,9 @@ internal/worker         Temporal execution layer: template registry, starter
                         (workflow starts by type name, used by the listener),
                         runner (one Temporal worker per template, used by the
                         worker), event bridge (events → workflow starts)
-  └─ userstoryreview    first agent template: userStoryReviewWorkflow skeleton
-                        (TASK-2 refinement agent) + commit trigger
+  └─ userstoryreview    first agent template: userStoryReviewWorkflow
+                        (TASK-2 refinement agent) + commit trigger + MR
+                        comment loop (TASK-11, inline review comments TASK-17)
 ```
 
 Detection goes through the pluggable `source.EventSource` abstraction: the

@@ -208,6 +208,43 @@ func (c *ForgejoClient) ListMergeRequestComments(ctx context.Context, repo strin
 	return comments, nil
 }
 
+// ListMergeRequestReviewComments implements Client. Inline review
+// comments live under the pulls reviews endpoints: every review of the
+// merge request carries its comments with their path and line. Dismissed
+// reviews are skipped. (Forgejo's single pulls/{n}/comments listing is
+// not used: it is not reliable across versions.)
+func (c *ForgejoClient) ListMergeRequestReviewComments(ctx context.Context, repo string, number int64) ([]Comment, error) {
+	base, err := repoPath(repo, "pulls/"+strconv.FormatInt(number, 10))
+	if err != nil {
+		return nil, err
+	}
+	var reviews []reviewResponse
+	if err := c.do(ctx, http.MethodGet, base+"/reviews", nil, nil, &reviews); err != nil {
+		return nil, err
+	}
+	var comments []Comment
+	for _, rv := range reviews {
+		if rv.Dismissed {
+			continue
+		}
+		var rcs []reviewCommentResponse
+		if err := c.do(ctx, http.MethodGet,
+			base+"/reviews/"+strconv.FormatInt(rv.ID, 10)+"/comments", nil, nil, &rcs); err != nil {
+			return nil, err
+		}
+		for _, rc := range rcs {
+			comments = append(comments, reviewCommentFrom(rc))
+		}
+	}
+	sort.Slice(comments, func(i, j int) bool {
+		if comments[i].CreatedAt != comments[j].CreatedAt {
+			return comments[i].CreatedAt < comments[j].CreatedAt
+		}
+		return comments[i].ID < comments[j].ID
+	})
+	return comments, nil
+}
+
 // AddMergeRequestComment implements Client.
 func (c *ForgejoClient) AddMergeRequestComment(ctx context.Context, repo string, number int64, body string) (Comment, error) {
 	path, err := repoPath(repo, "issues/"+strconv.FormatInt(number, 10)+"/comments")
@@ -423,6 +460,34 @@ func commentFrom(resp commentResponse) Comment {
 		Body:      resp.Body,
 		Author:    resp.User.Login,
 		CreatedAt: resp.CreatedAt,
+	}
+}
+
+type reviewResponse struct {
+	ID        int64  `json:"id"`
+	Dismissed bool   `json:"dismissed"`
+	State     string `json:"state"`
+}
+
+type reviewCommentResponse struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+	Path      string `json:"path"`
+	Line      int    `json:"line"` // new-file line; 0 when the comment is on a removed side or unknown
+	User      struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+func reviewCommentFrom(resp reviewCommentResponse) Comment {
+	return Comment{
+		ID:        resp.ID,
+		Body:      resp.Body,
+		Author:    resp.User.Login,
+		CreatedAt: resp.CreatedAt,
+		Path:      resp.Path,
+		Line:      resp.Line,
 	}
 }
 

@@ -121,6 +121,11 @@ type Comment struct {
 	Author string
 	// CreatedAt is the provider-formatted creation time.
 	CreatedAt string
+	// Path and Line are the comment's inline location when it is a review
+	// (diff) comment on a specific file and line; both are empty for a
+	// summary comment on the merge request overall.
+	Path string
+	Line int
 }
 
 // Client abstracts the provider repository operations the autonomous
@@ -166,6 +171,12 @@ type Client interface {
 	// ListMergeRequestComments returns the comments on a merge request,
 	// oldest first.
 	ListMergeRequestComments(ctx context.Context, repo string, number int64) ([]Comment, error)
+
+	// ListMergeRequestReviewComments returns the merge request's inline
+	// (diff) review comments across its reviews, oldest first, each with
+	// its Path and Line set. Summary comments on the merge request
+	// conversation are not included — see ListMergeRequestComments.
+	ListMergeRequestReviewComments(ctx context.Context, repo string, number int64) ([]Comment, error)
 
 	// AddMergeRequestComment adds a comment to a merge request and
 	// returns it.

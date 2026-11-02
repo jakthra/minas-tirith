@@ -27,8 +27,33 @@ type FindRefinementInput struct {
 	// the review workflow recorded in the Submission of its run.
 	MRNumber int64 `json:"mr_number"`
 	// CommentID identifies the comment being processed; used to detect
-	// comments an earlier run already answered.
+	// comments an earlier run already answered. For a review event it is
+	// the synthetic stand-in from the webhook payload.
 	CommentID int64 `json:"comment_id"`
+	// ReviewEvent marks input built from a review-submission delivery:
+	// the review's actual comments are resolved from the provider API.
+	ReviewEvent bool `json:"review_event,omitempty"`
+	// CommentBody and CommentAuthor carry the event's comment body and
+	// author; for a review event the body is the review's summary, used as
+	// a fallback when the review carries no comments.
+	CommentBody   string `json:"comment_body,omitempty"`
+	CommentAuthor string `json:"comment_author,omitempty"`
+	// PositionFile and PositionLine carry the event's inline position
+	// when the provider reported one (MrCommentInput.PositionFile). The
+	// activity prefers them over the API lookup for the event's comment.
+	PositionFile string `json:"position_file,omitempty"`
+	PositionLine int    `json:"position_line,omitempty"`
+}
+
+// ResolvedComment is the comment a run actually processes after the
+// provider API resolved the event: a real comment id, its body and author,
+// and its inline position when it is a review (diff) comment.
+type ResolvedComment struct {
+	ID           int64  `json:"id"`
+	Body         string `json:"body"`
+	Author       string `json:"author,omitempty"`
+	PositionFile string `json:"position_file,omitempty"`
+	PositionLine int    `json:"position_line,omitempty"`
 }
 
 // FindRefinementOutput is the correlation the FindRefinement activity
@@ -39,10 +64,12 @@ type FindRefinementOutput struct {
 	// branch the agent created (see RefinementBranchName). Anything else
 	// is out of scope for the comment loop, whatever its title.
 	IsRefinement bool `json:"is_refinement"`
-	// AlreadyProcessed reports whether the agent already responded to
-	// this comment in an earlier run: the merge request carries a
-	// response comment referencing it. Redelivering a comment whose
-	// run failed after committing but before responding is still safe.
+	// AlreadyProcessed reports whether there is nothing new to process:
+	// every comment this event resolves (the event's own and the
+	// pending review comments) was already answered by an earlier run —
+	// the merge request carries a response comment referencing it.
+	// Redelivering a comment whose run failed after committing but
+	// before responding is still safe.
 	AlreadyProcessed bool `json:"already_processed"`
 	// RefinementBranch is the merge request's head branch: the refine/*
 	// branch carrying the refinement tickets.
@@ -57,6 +84,15 @@ type FindRefinementOutput struct {
 	// workflow execution: its workflow ID is this prefix plus the
 	// remainder of the origin commit's SHA.
 	RefinementWorkflowIDPrefix string `json:"refinement_workflow_id_prefix,omitempty"`
+	// Comments are the comments this run must process, oldest first:
+	// for a review event, every review comment an earlier run has not
+	// answered; for a plain comment event, those plus the comment the
+	// event named. Comments left on a review after its submission event
+	// fired never get a webhook of their own (forgejo#7966), so every
+	// later comment or review event on the merge request rescans for
+	// unanswered ones. Empty means nothing new to process:
+	// AlreadyProcessed.
+	Comments []ResolvedComment `json:"comments,omitempty"`
 }
 
 // FindRefinement correlates a comment event to the refinement run that
@@ -95,20 +131,97 @@ func (a *Activities) FindRefinement(ctx context.Context, in FindRefinementInput)
 	out.OriginCommitShortSHA = refinementShortSHA(mr.Head)
 	out.RefinementWorkflowIDPrefix = refinementWorkflowIDPrefix(in.Provider, in.Repository, out.OriginCommitShortSHA)
 
-	// Detect comments an earlier run already answered: the agent's
-	// response references the comment id it answers (see
-	// responseMarkerFor). This keeps a redelivered or restarted comment
-	// from being applied twice.
+	// The MR's conversation comments (for the already-processed guard) and
+	// its inline review comments (to resolve what a comment event actually
+	// refers to: Forgejo webhooks carry no inline positions, and a review
+	// submission carries no comment at all — forgejo#7935/#7966).
 	comments, err := a.provider.ListMergeRequestComments(ctx, in.Repository, in.MRNumber)
 	if err != nil {
 		return FindRefinementOutput{}, fmt.Errorf("list comments on merge request %d in %s: %w",
 			in.MRNumber, in.Repository, err)
 	}
-	reference := responseMarkerFor(in.CommentID)
-	for _, c := range comments {
-		if strings.Contains(c.Body, reference) {
+	reviewComments, err := a.provider.ListMergeRequestReviewComments(ctx, in.Repository, in.MRNumber)
+	if err != nil {
+		return FindRefinementOutput{}, fmt.Errorf("list review comments on merge request %d in %s: %w",
+			in.MRNumber, in.Repository, err)
+	}
+
+	// answered reports whether an earlier run already responded to the
+	// comment with the given id: the agent's response references the
+	// comment id it answers (see responseMarkerFor). This keeps a
+	// redelivered or restarted comment from being applied twice.
+	answered := func(id int64) bool {
+		reference := responseMarkerFor(id)
+		for _, c := range comments {
+			if strings.Contains(c.Body, reference) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if in.ReviewEvent {
+		// A review submission: process every review comment an earlier
+		// run has not answered (the webhook payload named none),
+		// oldest first. A review that carried no comments at all falls
+		// back to its summary body under the synthetic id — a review
+		// with comments keeps its summary unprocessed, since the
+		// comments carry the feedback.
+		for _, rc := range reviewComments {
+			if answered(rc.ID) {
+				continue
+			}
+			out.Comments = append(out.Comments, resolvedFromReviewComment(rc))
+		}
+		if len(out.Comments) == 0 && len(reviewComments) == 0 &&
+			strings.TrimSpace(in.CommentBody) != "" && !answered(in.CommentID) {
+			out.Comments = append(out.Comments, ResolvedComment{
+				ID:     in.CommentID,
+				Body:   in.CommentBody,
+				Author: in.CommentAuthor,
+			})
+		}
+		if len(out.Comments) == 0 {
 			out.AlreadyProcessed = true
-			break
+		}
+	} else {
+		// A plain comment event: the comment itself, with its inline
+		// position looked up among the MR's review comments when the
+		// webhook did not carry one — and, before it, every unanswered
+		// review comment: Forgejo fires no per-comment webhook for
+		// comments left during a review (forgejo#7966), so this event is
+		// the only trigger that can pick them up.
+		event := ResolvedComment{
+			ID:     in.CommentID,
+			Body:   in.CommentBody,
+			Author: in.CommentAuthor,
+		}
+		if in.PositionFile != "" {
+			event.PositionFile = in.PositionFile
+			event.PositionLine = in.PositionLine
+		}
+		for _, rc := range reviewComments {
+			if rc.ID == in.CommentID {
+				// The event's comment is itself a review comment: keep
+				// it out of the rescan (it is processed once, below)
+				// and let the API fill its position when the webhook
+				// did not carry one.
+				if rc.Path != "" && event.PositionFile == "" {
+					event.PositionFile = rc.Path
+					event.PositionLine = rc.Line
+				}
+				continue
+			}
+			if answered(rc.ID) {
+				continue
+			}
+			out.Comments = append(out.Comments, resolvedFromReviewComment(rc))
+		}
+		if !answered(in.CommentID) {
+			out.Comments = append(out.Comments, event)
+		}
+		if len(out.Comments) == 0 {
+			out.AlreadyProcessed = true
 		}
 	}
 
@@ -118,9 +231,23 @@ func (a *Activities) FindRefinement(ctx context.Context, in FindRefinementInput)
 			"repository", in.Repository, "mr", in.MRNumber,
 			"refinement_branch", out.RefinementBranch,
 			"origin_commit", out.OriginCommitShortSHA,
+			"comments", len(out.Comments),
 			"already_processed", out.AlreadyProcessed)
 	}
 	return out, nil
+}
+
+// resolvedFromReviewComment maps one inline review comment from the
+// provider API onto the comment a run processes: its real id, body,
+// author, and inline position.
+func resolvedFromReviewComment(rc provider.Comment) ResolvedComment {
+	return ResolvedComment{
+		ID:           rc.ID,
+		Body:         rc.Body,
+		Author:       rc.Author,
+		PositionFile: rc.Path,
+		PositionLine: rc.Line,
+	}
 }
 
 // --- CollectTickets: the MR's tickets and their current content (AC4) ---

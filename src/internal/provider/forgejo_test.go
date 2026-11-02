@@ -552,6 +552,60 @@ func TestForgejoClientMergeRequestComments(t *testing.T) {
 	})
 }
 
+func TestForgejoClientMergeRequestReviewComments(t *testing.T) {
+	reviewComment := func(id int64, body, createdAt, path string, line any) map[string]any {
+		return map[string]any{
+			"id":         id,
+			"body":       body,
+			"created_at": createdAt,
+			"path":       path,
+			"line":       line,
+			"user":       map[string]any{"login": "reviewer"},
+		}
+	}
+
+	c, rec := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repos/root/test/pulls/7/reviews":
+			respondJSON(w, http.StatusOK, []map[string]any{
+				{"id": 2, "state": "COMMENT", "dismissed": true},
+				{"id": 1, "state": "COMMENT", "dismissed": false},
+			})
+		case "/api/v1/repos/root/test/pulls/7/reviews/1/comments":
+			respondJSON(w, http.StatusOK, []map[string]any{
+				reviewComment(39, "later comment", "2026-11-02T10:48:20+01:00", "backlog/tasks/task-012 - Create-watering-history-model.md", nil),
+				reviewComment(37, "first comment", "2026-11-02T10:45:21+01:00", "backlog/tasks/task-012 - Create-watering-history-model.md", 22),
+			})
+		default:
+			respondJSON(w, http.StatusNotFound, forgejoError("The target couldn't be found."))
+		}
+	})
+
+	comments, err := c.ListMergeRequestReviewComments(context.Background(), "root/test", 7)
+	if err != nil {
+		t.Fatalf("ListMergeRequestReviewComments: %v", err)
+	}
+	want := []Comment{
+		{ID: 37, Body: "first comment", Author: "reviewer", CreatedAt: "2026-11-02T10:45:21+01:00",
+			Path: "backlog/tasks/task-012 - Create-watering-history-model.md", Line: 22},
+		{ID: 39, Body: "later comment", Author: "reviewer", CreatedAt: "2026-11-02T10:48:20+01:00",
+			Path: "backlog/tasks/task-012 - Create-watering-history-model.md"},
+	}
+	if !reflect.DeepEqual(comments, want) {
+		t.Errorf("comments = %+v, want %+v (oldest first, dismissed reviews skipped)", comments, want)
+	}
+	for _, got := range rec.all() {
+		if strings.Contains(got.Path, "/reviews/2/") {
+			t.Errorf("dismissed review's comments were requested: %s", got.Path)
+		}
+	}
+
+	// The merge request does not exist.
+	if _, err := c.ListMergeRequestReviewComments(context.Background(), "root/test", 99); !errors.Is(err, ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestForgejoClientAPIError(t *testing.T) {
 	c, _ := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusForbidden, forgejoError("token lacks scope"))

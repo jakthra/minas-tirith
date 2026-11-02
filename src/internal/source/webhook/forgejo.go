@@ -3,6 +3,7 @@ package webhook
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,7 +16,8 @@ import (
 
 // ForgejoAdapter handles webhook deliveries from Forgejo (and Gitea, whose
 // wire format it shares). It verifies HMAC-SHA256 signatures and parses
-// push and issue-comment payloads into provider-agnostic events.
+// push, issue-comment, and pull-request-review payloads into
+// provider-agnostic events.
 //
 // Header and payload formats were captured from a live Forgejo 16 instance;
 // Forgejo sends both X-Forgejo-* and X-Gitea-* header aliases with identical
@@ -64,12 +66,18 @@ func (a *ForgejoAdapter) Parse(header http.Header, body []byte, project string) 
 	switch strings.ToLower(deliveryEvent(header)) {
 	case "push":
 		return a.parsePush(body, project)
-	// Forgejo reports merge request comments as event "issue_comment" with
-	// event type "pull_request_comment"; older Gitea versions may use
-	// "pull_request_comment" as the event itself. The payload shape is the
-	// same for both.
-	case "issue_comment", "pull_request_comment":
+	// Merge request conversation comments arrive as "issue_comment" (the
+	// X-Forgejo-Event-Type header may say "pull_request_comment").
+	case "issue_comment":
 		return a.parseIssueComment(body, project)
+	// Review submissions (inline diff comments plus the review's summary)
+	// arrive as "pull_request_comment" / "pull_request_approved" /
+	// "pull_request_rejected" with action "reviewed" and a review object
+	// instead of a comment object (forgejo#7935/#7966: the payload carries
+	// no comment id and no inline position, and review.content is empty
+	// for comment-only reviews).
+	case "pull_request_comment", "pull_request_approved", "pull_request_rejected":
+		return a.parsePullRequestReview(body, project)
 	default:
 		slog.Info("ignoring forgejo delivery", "event", deliveryEvent(header), "project", project)
 		return nil, nil
@@ -168,6 +176,27 @@ type pullRequestField struct {
 	URL    string     `json:"html_url"`
 	State  string     `json:"state"`
 	User   *userField `json:"user"`
+}
+
+// pullRequestReviewPayload is the payload Forgejo sends for the
+// pull_request_comment / pull_request_approved / pull_request_rejected
+// events: a review submission on a merge request. Unlike
+// issueCommentPayload it carries no comment object — the review's
+// individual comments are not in the webhook payload at all (forgejo#7966),
+// and the review content is empty for comment-only reviews (forgejo#7935).
+type pullRequestReviewPayload struct {
+	Action      string            `json:"action"`
+	Number      int64             `json:"number"`
+	PullRequest *pullRequestField `json:"pull_request"`
+	Review      *reviewField      `json:"review"`
+	Repository  repositoryField   `json:"repository"`
+	Sender      *userField        `json:"sender"`
+	CommitID    string            `json:"commit_id"`
+}
+
+type reviewField struct {
+	Type    string `json:"type"`
+	Content string `json:"content"`
 }
 
 // --- parsing ---
@@ -275,6 +304,73 @@ func (a *ForgejoAdapter) parseIssueComment(body []byte, project string) ([]event
 		ev.Comment.Author = personFromUser(p.Comment.User)
 	}
 	return []event.Event{ev}, nil
+}
+
+// parsePullRequestReview turns a review-submission delivery into one
+// review-flagged comment event. The payload identifies the merge request
+// and the reviewer and carries the review's summary content, but not the
+// individual inline comments or their positions, so the event's comment ID
+// is a synthetic stand-in derived from the payload (stable across
+// redeliveries, so dedupe keeps working) and consumers resolve the review's
+// actual comments through the provider API.
+func (a *ForgejoAdapter) parsePullRequestReview(body []byte, project string) ([]event.Event, error) {
+	var p pullRequestReviewPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("parse pull request review payload: %w", err)
+	}
+	if p.Review == nil {
+		slog.Info("ignoring review delivery without a review object", "action", p.Action, "project", project)
+		return nil, nil
+	}
+
+	mr := event.MergeRequest{State: "open"}
+	switch {
+	case p.PullRequest != nil:
+		mr.Number = p.PullRequest.Number
+		mr.Title = p.PullRequest.Title
+		mr.URL = p.PullRequest.URL
+		mr.State = p.PullRequest.State
+		if p.PullRequest.User != nil {
+			mr.Author = personFromUser(p.PullRequest.User)
+		}
+	default:
+		mr.Number = p.Number
+	}
+	if mr.Number <= 0 {
+		slog.Info("ignoring review delivery without a merge request number", "project", project)
+		return nil, nil
+	}
+
+	ev := event.Event{
+		Kind:       event.KindComment,
+		Provider:   a.name,
+		Project:    project,
+		Repository: p.Repository.FullName,
+		Comment: &event.Comment{
+			ID:     syntheticCommentID(body),
+			Body:   p.Review.Content,
+			MR:     &mr,
+			Review: true,
+		},
+	}
+	if p.Sender != nil {
+		ev.Comment.Author = personFromUser(p.Sender)
+	}
+	return []event.Event{ev}, nil
+}
+
+// syntheticCommentID derives a stable positive stand-in comment ID from a
+// review payload that carries none: the first 8 bytes of the payload's
+// SHA-256, with the sign bit cleared. Redeliveries of the same payload hash
+// to the same ID, so duplicate suppression keeps working; a collision with
+// a real comment ID is practically impossible.
+func syntheticCommentID(body []byte) int64 {
+	sum := sha256.Sum256(body)
+	id := int64(binary.BigEndian.Uint64(sum[:8]) & 0x7fffffffffffffff)
+	if id == 0 {
+		id = 1
+	}
+	return id
 }
 
 // branchFromRef splits a full ref into its branch name. Only branch refs

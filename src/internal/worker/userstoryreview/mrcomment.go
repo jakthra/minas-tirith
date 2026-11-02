@@ -88,14 +88,22 @@ type MrCommentInput struct {
 	CommentAuthor string `json:"comment_author,omitempty"`
 	// PositionFile and PositionLine carry the comment's inline location
 	// when the provider reported one (a comment on a specific file and
-	// line). Forgejo webhooks do not deliver inline comment locations
-	// today, so these are usually empty and inline-ness is interpreted
-	// from the comment body instead.
+	// line). Forgejo webhooks do not deliver inline comment locations, so
+	// these are empty on the event and the FindRefinement activity
+	// resolves them through the provider API instead.
 	PositionFile string `json:"position_file,omitempty"`
 	PositionLine int    `json:"position_line,omitempty"`
+	// ReviewEvent marks input built from a review-submission delivery
+	// (e.g. Forgejo's pull_request_comment event with action "reviewed"):
+	// CommentID is then a synthetic stand-in and CommentBody may be empty
+	// — the FindRefinement activity resolves the review's actual comments
+	// through the provider API.
+	ReviewEvent bool `json:"review_event,omitempty"`
 }
 
 // Validate reports whether the payload identifies a processable comment.
+// A review event needs no body up front: the real comment is resolved from
+// the provider API before interpretation.
 func (in MrCommentInput) Validate() error {
 	if strings.TrimSpace(in.Repository) == "" {
 		return errors.New("repository is required")
@@ -106,33 +114,40 @@ func (in MrCommentInput) Validate() error {
 	if in.CommentID <= 0 {
 		return errors.New("comment id is required")
 	}
-	if strings.TrimSpace(in.CommentBody) == "" {
+	if !in.ReviewEvent && strings.TrimSpace(in.CommentBody) == "" {
 		return errors.New("comment body is required")
 	}
 	return nil
 }
 
-// MrCommentResult is the outcome of one merge request comment run.
+// MrCommentResult is the outcome of one merge request comment run: the
+// processing of every comment one event resolved — usually a single
+// comment, but a review event may resolve several (see
+// FindRefinementOutput.Comments).
 type MrCommentResult struct {
-	// Processed reports that the comment was handled: interpreted,
-	// ticket updates applied, and a response posted.
+	// Processed reports that the run handled at least one comment:
+	// interpreted it, applied its ticket updates, and posted a response.
 	Processed bool `json:"processed"`
+	// ProcessedComments lists the ids of the comments the run answered,
+	// in processing order: one entry per response comment posted.
+	ProcessedComments []int64 `json:"processed_comments,omitempty"`
 	// Status summarizes what the run did.
 	Status string `json:"status"`
-	// Classification is how the comment was interpreted: inline,
-	// summary, or none (empty when the run did not interpret it).
+	// Classification is how the last processed comment was interpreted:
+	// inline, summary, or none (empty when the run interpreted nothing).
 	Classification string `json:"classification,omitempty"`
-	// UpdatedFiles lists the ticket files the run rewrote.
+	// UpdatedFiles lists the ticket files the run rewrote across all
+	// processed comments, in processing order.
 	UpdatedFiles []string `json:"updated_files,omitempty"`
-	// CommitSHA is the commit that carried the updated tickets onto the
-	// merge request's branch.
+	// CommitSHA is the commit that carried the last processed comment's
+	// updated tickets onto the merge request's branch (each processed
+	// comment's response names its own commit).
 	CommitSHA string `json:"commit_sha,omitempty"`
-	// ResponsePosted reports whether the response comment went onto the
-	// merge request.
+	// ResponsePosted reports whether a response comment went onto the
+	// merge request for every processed comment.
 	ResponsePosted bool `json:"response_posted"`
-	// AlreadyProcessed reports that an earlier run already answered this
-	// comment (the merge request carries the agent's response to it), so
-	// this run did nothing.
+	// AlreadyProcessed reports that an earlier run already answered
+	// every comment this event resolved, so this run did nothing.
 	AlreadyProcessed bool `json:"already_processed,omitempty"`
 
 	// Correlation of the comment back to the refinement run that
@@ -163,12 +178,19 @@ type MrCommentResult struct {
 //     re-verifies through the provider before any ticket is touched);
 //   - comments carrying the agent response marker: the agent's own
 //     responses, which the loop must never pick up again.
+//
+// Review-submission events (event.Comment.Review) pass with an empty body:
+// their comment ID is synthetic and the review's actual comments are
+// resolved later through the provider API.
 func MrCommentInputFromEvent(ev event.Event) (any, bool) {
 	if ev.Kind != event.KindComment || ev.Comment == nil || ev.Comment.MR == nil {
 		return nil, false
 	}
 	c := ev.Comment
-	if c.MR.Number <= 0 || c.ID <= 0 || strings.TrimSpace(c.Body) == "" {
+	if c.MR.Number <= 0 || c.ID <= 0 {
+		return nil, false
+	}
+	if !c.Review && strings.TrimSpace(c.Body) == "" {
 		return nil, false
 	}
 	if !IsRefinementTitle(c.MR.Title) {
@@ -186,6 +208,7 @@ func MrCommentInputFromEvent(ev event.Event) (any, bool) {
 		CommentID:     c.ID,
 		CommentBody:   c.Body,
 		CommentAuthor: authorName(c.Author),
+		ReviewEvent:   c.Review,
 	}
 	if c.Position != nil {
 		in.PositionFile = c.Position.File
@@ -214,11 +237,13 @@ func responseMarkerFor(commentID int64) string {
 	return fmt.Sprintf("%s response to comment %d -->", AgentResponseMarker, commentID)
 }
 
-// MrCommentWorkflow responds to one user comment on a refinement merge
+// MrCommentWorkflow responds to a user comment on a refinement merge
 // request the agent opened (step 4 of the TASK-2 flow): the comment is
 // interpreted, the refinement tickets are updated accordingly, the
 // updates are committed to the merge request's branch, and a response
-// comment summarizes what changed and why.
+// comment summarizes what changed and why. A review-submission event
+// may carry several inline comments; every comment the event resolves is
+// processed (see MrCommentProcessorWorkflow).
 //
 // Comments on the same merge request must never be applied
 // concurrently: two runs rewriting the same branch would overwrite each
@@ -295,7 +320,7 @@ func acquireMrCommentSlot(ctx workflow.Context, in MrCommentInput) (workflow.Chi
 func acquireChildWorkflowSlot(ctx workflow.Context, workflowID string, fn any, input any) (workflow.ChildWorkflowFuture, error) {
 	logger := workflow.GetLogger(ctx)
 	childCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-		WorkflowID:                workflowID,
+		WorkflowID:               workflowID,
 		WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 		WorkflowExecutionTimeout: mrCommentProcessorTimeout,
 	})
@@ -329,18 +354,22 @@ func acquireChildWorkflowSlot(ctx workflow.Context, workflowID string, fn any, i
 	}
 }
 
-// MrCommentProcessorWorkflow processes one comment on one refinement
-// merge request. It runs as a child workflow whose ID is per merge
-// request (see acquireMrCommentSlot), which serializes comments on the
-// same MR. All provider and LLM API calls run inside activities, so
-// the workflow body stays deterministic.
+// MrCommentProcessorWorkflow processes the comments one event resolved
+// on one refinement merge request — usually a single comment, but a
+// review-submission event may resolve several inline comments, and any
+// event also picks up review comments no earlier run answered. It runs
+// as a child workflow whose ID is per merge request (see
+// acquireMrCommentSlot), which serializes comment handling on the same
+// MR. All provider and LLM API calls run inside activities, so the
+// workflow body stays deterministic.
 func MrCommentProcessorWorkflow(ctx workflow.Context, in MrCommentInput) (MrCommentResult, error) {
 	if err := in.Validate(); err != nil {
 		return MrCommentResult{}, fmt.Errorf("invalid %s input: %w", MrCommentProcessorWorkflowName, err)
 	}
 	logger := workflow.GetLogger(ctx)
-	logger.Info("processing mr comment",
-		"repository", in.Repository, "mr", in.MRNumber, "comment", in.CommentID)
+	logger.Info("processing mr comment event",
+		"repository", in.Repository, "mr", in.MRNumber,
+		"comment", in.CommentID, "review_event", in.ReviewEvent)
 
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout:    10 * time.Minute,
@@ -355,13 +384,21 @@ func MrCommentProcessorWorkflow(ctx workflow.Context, in MrCommentInput) (MrComm
 
 	// Correlate the comment to the refinement run that created the MR:
 	// the MR number identifies the Submission the review workflow
-	// recorded, and the MR's head branch carries the tickets.
+	// recorded, and the MR's head branch carries the tickets. The
+	// activity also resolves what this event actually asks the run to
+	// process: the event's comment plus, for review events, every
+	// review comment no earlier run answered (see found.Comments).
 	var found FindRefinementOutput
 	if err := workflow.ExecuteActivity(ctx, FindRefinementName, FindRefinementInput{
-		Provider:   in.Provider,
-		Repository: in.Repository,
-		MRNumber:   in.MRNumber,
-		CommentID:  in.CommentID,
+		Provider:      in.Provider,
+		Repository:    in.Repository,
+		MRNumber:      in.MRNumber,
+		CommentID:     in.CommentID,
+		ReviewEvent:   in.ReviewEvent,
+		CommentBody:   in.CommentBody,
+		CommentAuthor: in.CommentAuthor,
+		PositionFile:  in.PositionFile,
+		PositionLine:  in.PositionLine,
 	}).Get(ctx, &found); err != nil {
 		return MrCommentResult{}, fmt.Errorf("find refinement for mr %d: %w", in.MRNumber, err)
 	}
@@ -390,80 +427,121 @@ func MrCommentProcessorWorkflow(ctx workflow.Context, in MrCommentInput) (MrComm
 		return result, nil
 	}
 
-	// The MR's tickets as they exist right now: their current content
-	// is what the interpretation updates.
-	var tickets []RefinementTicket
-	if err := workflow.ExecuteActivity(ctx, CollectTicketsName, CollectTicketsInput{
-		Repository:       in.Repository,
-		RefinementBranch: found.RefinementBranch,
-		BaseBranch:       found.BaseBranch,
-	}).Get(ctx, &tickets); err != nil {
-		return result, fmt.Errorf("collect tickets from %s: %w", found.RefinementBranch, err)
-	}
+	// Process every comment the event resolved, strictly one after
+	// another: a review submission may carry several inline comments,
+	// and later events rescan for review comments that arrived after
+	// the review's own event (Forgejo fires no per-comment webhook for
+	// them). The loop runs inside this per-MR processor — one execution
+	// per merge request at a time — so no two comments on one MR are
+	// ever applied concurrently; and each round re-collects the
+	// tickets, so a later comment is interpreted against the content an
+	// earlier comment's commit wrote.
+	var classifications []string
+	for _, rc := range found.Comments {
+		// The event's comment may have been a synthetic stand-in (a
+		// review submission): from here on use the comment the activity
+		// resolved — real id, body, author, and inline position.
+		commentIn := in
+		commentIn.CommentID = rc.ID
+		commentIn.CommentBody = rc.Body
+		if rc.Author != "" {
+			commentIn.CommentAuthor = rc.Author
+		}
+		commentIn.PositionFile = rc.PositionFile
+		commentIn.PositionLine = rc.PositionLine
+		commentIn.ReviewEvent = false
+		logger.Info("processing mr comment",
+			"repository", in.Repository, "mr", in.MRNumber, "comment", rc.ID,
+			"position_file", rc.PositionFile, "pending", len(found.Comments))
 
-	// Interpret the comment against those tickets with the LLM.
-	var interpretation CommentInterpretation
-	if err := workflow.ExecuteActivity(ctx, InterpretCommentName, InterpretCommentInput{
-		Repository: in.Repository,
-		MRNumber:   in.MRNumber,
-		MRTitle:    in.MRTitle,
-		Comment: CommentFeedback{
-			ID:           in.CommentID,
-			Body:         in.CommentBody,
-			Author:       in.CommentAuthor,
-			PositionFile: in.PositionFile,
-			PositionLine: in.PositionLine,
-		},
-		Tickets: tickets,
-	}).Get(ctx, &interpretation); err != nil {
-		return result, fmt.Errorf("interpret comment %d: %w", in.CommentID, err)
-	}
-	result.Classification = interpretation.Classification
+		// The MR's tickets as they exist right now: their current content
+		// is what the interpretation updates.
+		var tickets []RefinementTicket
+		if err := workflow.ExecuteActivity(ctx, CollectTicketsName, CollectTicketsInput{
+			Repository:       in.Repository,
+			RefinementBranch: found.RefinementBranch,
+			BaseBranch:       found.BaseBranch,
+		}).Get(ctx, &tickets); err != nil {
+			return result, fmt.Errorf("collect tickets from %s: %w", found.RefinementBranch, err)
+		}
 
-	// Deterministic validation before anything is committed: the
-	// interpretation may only rewrite ticket files the MR carries, and
-	// a comment with a reported inline position on one of those
-	// tickets may only update that ticket.
-	updates, err := validatedUpdates(interpretation, tickets, in)
-	if err != nil {
-		return result, fmt.Errorf("interpret comment %d: %w", in.CommentID, err)
-	}
-
-	if len(updates) > 0 {
-		// Commit the updated tickets to the merge request's branch —
-		// the same refine/* branch the MR is proposing, never a new
-		// one.
-		var applied ApplyTicketUpdatesResult
-		if err := workflow.ExecuteActivity(ctx, ApplyTicketUpdatesName, ApplyTicketUpdatesInput{
+		// Interpret the comment against those tickets with the LLM.
+		var interpretation CommentInterpretation
+		if err := workflow.ExecuteActivity(ctx, InterpretCommentName, InterpretCommentInput{
 			Repository: in.Repository,
 			MRNumber:   in.MRNumber,
-			Branch:     found.RefinementBranch,
-			CommentID:  in.CommentID,
-			Updates:   updates,
-		}).Get(ctx, &applied); err != nil {
-			return result, fmt.Errorf("apply ticket updates to %s: %w", found.RefinementBranch, err)
+			MRTitle:    in.MRTitle,
+			Comment: CommentFeedback{
+				ID:           rc.ID,
+				Body:         rc.Body,
+				Author:       commentIn.CommentAuthor,
+				PositionFile: rc.PositionFile,
+				PositionLine: rc.PositionLine,
+			},
+			Tickets: tickets,
+		}).Get(ctx, &interpretation); err != nil {
+			return result, fmt.Errorf("interpret comment %d: %w", rc.ID, err)
 		}
-		result.UpdatedFiles = applied.UpdatedFiles
-		result.CommitSHA = applied.CommitSHA
-	}
 
-	// Respond on the MR with what changed and why.
-	var posted PostResponseCommentResult
-	if err := workflow.ExecuteActivity(ctx, PostResponseCommentName, PostResponseCommentInput{
-		Repository: in.Repository,
-		MRNumber:   in.MRNumber,
-		Body:       buildResponseComment(in, interpretation, updates, result),
-	}).Get(ctx, &posted); err != nil {
-		return result, fmt.Errorf("post response comment on mr %d: %w", in.MRNumber, err)
+		// Deterministic validation before anything is committed: the
+		// interpretation may only rewrite ticket files the MR carries, and
+		// a comment with a reported inline position on one of those
+		// tickets may only update that ticket.
+		updates, err := validatedUpdates(interpretation, tickets, commentIn)
+		if err != nil {
+			return result, fmt.Errorf("interpret comment %d: %w", rc.ID, err)
+		}
+
+		commentRes := MrCommentResult{
+			MRNumber:         in.MRNumber,
+			RefinementBranch: found.RefinementBranch,
+			BaseBranch:       found.BaseBranch,
+		}
+		if len(updates) > 0 {
+			// Commit the updated tickets to the merge request's branch —
+			// the same refine/* branch the MR is proposing, never a new
+			// one.
+			var applied ApplyTicketUpdatesResult
+			if err := workflow.ExecuteActivity(ctx, ApplyTicketUpdatesName, ApplyTicketUpdatesInput{
+				Repository: in.Repository,
+				MRNumber:   in.MRNumber,
+				Branch:     found.RefinementBranch,
+				CommentID:  rc.ID,
+				Updates:    updates,
+			}).Get(ctx, &applied); err != nil {
+				return result, fmt.Errorf("apply ticket updates to %s: %w", found.RefinementBranch, err)
+			}
+			commentRes.UpdatedFiles = applied.UpdatedFiles
+			commentRes.CommitSHA = applied.CommitSHA
+		}
+
+		// Respond on the MR with what changed and why, so a later run
+		// recognizes this comment as answered.
+		var posted PostResponseCommentResult
+		if err := workflow.ExecuteActivity(ctx, PostResponseCommentName, PostResponseCommentInput{
+			Repository: in.Repository,
+			MRNumber:   in.MRNumber,
+			Body:       buildResponseComment(commentIn, interpretation, updates, commentRes),
+		}).Get(ctx, &posted); err != nil {
+			return result, fmt.Errorf("post response comment on mr %d: %w", in.MRNumber, err)
+		}
+
+		result.ProcessedComments = append(result.ProcessedComments, rc.ID)
+		result.Classification = interpretation.Classification
+		result.UpdatedFiles = append(result.UpdatedFiles, commentRes.UpdatedFiles...)
+		if commentRes.CommitSHA != "" {
+			result.CommitSHA = commentRes.CommitSHA
+		}
+		classifications = append(classifications, interpretation.Classification)
+		logger.Info("mr comment processed",
+			"repository", in.Repository, "mr", in.MRNumber, "comment", rc.ID,
+			"classification", interpretation.Classification, "updated_files", len(updates),
+			"commit", ShortSHA(commentRes.CommitSHA))
 	}
 
 	result.Processed = true
 	result.ResponsePosted = true
-	result.Status = classificationStatus(interpretation.Classification, len(updates))
-	logger.Info("mr comment processed",
-		"repository", in.Repository, "mr", in.MRNumber, "comment", in.CommentID,
-		"classification", interpretation.Classification, "updated_files", len(updates),
-		"commit", ShortSHA(result.CommitSHA))
+	result.Status = runStatus(classifications, len(result.UpdatedFiles))
 	return result, nil
 }
 
@@ -523,6 +601,27 @@ func classificationStatus(classification string, updated int) string {
 	default:
 		return "no ticket changes needed"
 	}
+}
+
+// runStatus summarizes a run by the classifications of the comments it
+// processed (and, for a single-comment run, that comment's update
+// count): one comment keeps the per-comment classification status;
+// several read as a count.
+func runStatus(classifications []string, updated int) string {
+	if len(classifications) == 1 {
+		return classificationStatus(classifications[0], updated)
+	}
+	counts := make(map[string]int, len(classifications))
+	for _, c := range classifications {
+		counts[c]++
+	}
+	var parts []string
+	for _, c := range []string{ClassificationInline, ClassificationSummary, ClassificationNone} {
+		if counts[c] > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", counts[c], c))
+		}
+	}
+	return fmt.Sprintf("processed %d comments: %s", len(classifications), strings.Join(parts, ", "))
 }
 
 // buildResponseComment composes the comment the agent posts in answer
@@ -604,5 +703,5 @@ func refinementWorkflowIDPrefix(provider, repository, shortSHA string) string {
 	if shortSHA == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s-%s|%s|%s", WorkflowName, provider, repository, shortSHA)
+	return fmt.Sprintf("%s-%s|%s|commit|%s", WorkflowName, provider, repository, shortSHA)
 }

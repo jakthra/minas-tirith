@@ -292,6 +292,218 @@ func TestForgejoParseCommentFiltering(t *testing.T) {
 	}
 }
 
+func TestForgejoParseCommentInlinePosition(t *testing.T) {
+	// Forgejo webhooks do not deliver inline comment locations today
+	// (forgejo#7935/#7966), so the adapter parses the fields only when
+	// a delivery carries them; a summary comment has no position.
+	newPayload := func(comment map[string]any) []byte {
+		payload := map[string]any{
+			"action":       "created",
+			"is_pull":      true,
+			"repository":   map[string]any{"full_name": "root/BeanieGenie"},
+			"issue":        map[string]any{"number": 1, "pull_request": map[string]any{"merged": false}},
+			"pull_request": map[string]any{"number": 1, "title": "t", "state": "open"},
+			"comment":      comment,
+		}
+		body, _ := json.Marshal(payload)
+		return body
+	}
+	tests := []struct {
+		name     string
+		comment  map[string]any
+		wantFile string
+		wantLine int
+	}{
+		{
+			name: "inline comment with path and line",
+			comment: map[string]any{
+				"id": 42, "body": "too simple",
+				"created_at": "2026-10-26T13:05:54+01:00",
+				"user":       map[string]any{"login": "root"},
+				"path":       "backlog/tasks/task-002 - Add-login-endpoint.md",
+				"line":       12,
+			},
+			wantFile: "backlog/tasks/task-002 - Add-login-endpoint.md",
+			wantLine: 12,
+		},
+		{
+			name: "inline comment with path only",
+			comment: map[string]any{
+				"id": 42, "body": "too simple",
+				"created_at": "2026-10-26T13:05:54+01:00",
+				"user":       map[string]any{"login": "root"},
+				"path":       "backlog/tasks/task-002 - Add-login-endpoint.md",
+			},
+			wantFile: "backlog/tasks/task-002 - Add-login-endpoint.md",
+			wantLine: 0,
+		},
+		{
+			name: "summary comment carries no position",
+			comment: map[string]any{
+				"id": 42, "body": "hello",
+				"created_at": "2026-10-26T13:05:54+01:00",
+				"user":       map[string]any{"login": "root"},
+			},
+			wantFile: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := NewForgejoAdapter("forgejo")
+			header := http.Header{}
+			header.Set("X-Forgejo-Event", "issue_comment")
+			events, err := adapter.Parse(header, newPayload(tt.comment), "BeanieGenie")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1", len(events))
+			}
+			c := events[0].Comment
+			if tt.wantFile == "" {
+				if c.Position != nil {
+					t.Errorf("Position = %+v, want nil", c.Position)
+				}
+				return
+			}
+			if c.Position == nil {
+				t.Fatal("Position is nil, want the inline location")
+			}
+			if c.Position.File != tt.wantFile || c.Position.Line != tt.wantLine {
+				t.Errorf("Position = %+v, want file %q line %d", c.Position, tt.wantFile, tt.wantLine)
+			}
+		})
+	}
+}
+
+// reviewPayload builds a pull_request review-submission payload the way
+// Forgejo sends it for the pull_request_comment / pull_request_approved /
+// pull_request_rejected events: action "reviewed", the merge request, and a
+// review object — no comment object, no inline position (forgejo#7935/#7966).
+func reviewPayload(action, reviewType, reviewContent string) []byte {
+	payload := map[string]any{
+		"action": action,
+		"number": 12,
+		"pull_request": map[string]any{
+			"number":   12,
+			"title":    "Refine TASK-011: Track watering history per plant",
+			"state":    "open",
+			"html_url": "http://localhost:3000/root/BeanieGenie/pulls/12",
+			"user":     map[string]any{"login": "minas-tirith-agent"},
+		},
+		"repository": map[string]any{"name": "BeanieGenie", "full_name": "root/BeanieGenie"},
+		"sender":     map[string]any{"login": "root", "full_name": "Root User"},
+		"commit_id":  "1db4a5ad2d41cc3e2a719e9bf356453427287d7c",
+	}
+	if reviewType != "" {
+		payload["review"] = map[string]any{"type": reviewType, "content": reviewContent}
+	}
+	body, _ := json.Marshal(payload)
+	return body
+}
+
+func TestForgejoParsePullRequestReview(t *testing.T) {
+	adapter := NewForgejoAdapter("forgejo")
+
+	t.Run("review comment submission with empty content", func(t *testing.T) {
+		body := reviewPayload("reviewed", "pull_request_review_comment", "")
+		for _, headerEvent := range []string{"pull_request_comment", "pull_request_approved", "pull_request_rejected"} {
+			header := http.Header{}
+			header.Set("X-Forgejo-Event", headerEvent)
+			events, err := adapter.Parse(header, body, "BeanieGenie")
+			if err != nil {
+				t.Fatalf("event %q: %v", headerEvent, err)
+			}
+			if len(events) != 1 {
+				t.Fatalf("event %q: got %d events, want 1", headerEvent, len(events))
+			}
+			ev := events[0]
+			if ev.Kind != "comment" || ev.Comment == nil {
+				t.Fatalf("event %q: kind/comment = %q/%v, want a comment event", headerEvent, ev.Kind, ev.Comment)
+			}
+			c := ev.Comment
+			if !c.Review {
+				t.Errorf("event %q: Review = false, want true (review-submission delivery)", headerEvent)
+			}
+			if c.ID <= 0 {
+				t.Errorf("event %q: synthetic comment id = %d, want > 0", headerEvent, c.ID)
+			}
+			if c.Body != "" {
+				t.Errorf("event %q: body = %q, want empty (review content was empty)", headerEvent, c.Body)
+			}
+			if c.Author.Username != "root" {
+				t.Errorf("event %q: author = %+v, want sender root", headerEvent, c.Author)
+			}
+			if c.Position != nil {
+				t.Errorf("event %q: Position = %+v, want nil (webhook carries no inline position)", headerEvent, c.Position)
+			}
+			if c.MR == nil || c.MR.Number != 12 || c.MR.Title != "Refine TASK-011: Track watering history per plant" {
+				t.Errorf("event %q: MR = %+v, want MR !12 with its title", headerEvent, c.MR)
+			}
+			if ev.Repository != "root/BeanieGenie" {
+				t.Errorf("event %q: repository = %q", headerEvent, ev.Repository)
+			}
+		}
+	})
+
+	t.Run("review summary content becomes the comment body", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("X-Forgejo-Event", "pull_request_comment")
+		events, err := adapter.Parse(header, reviewPayload("reviewed", "pull_request_review_comment", "Finished review"), "BeanieGenie")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(events) != 1 || events[0].Comment.Body != "Finished review" {
+			t.Fatalf("events = %+v, want one event carrying the review content", events)
+		}
+	})
+
+	t.Run("synthetic id is stable across redeliveries", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("X-Forgejo-Event", "pull_request_comment")
+		body := reviewPayload("reviewed", "pull_request_review_comment", "")
+		first, err := adapter.Parse(header, body, "BeanieGenie")
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := adapter.Parse(header, body, "BeanieGenie")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first[0].DedupeKey() != second[0].DedupeKey() {
+			t.Errorf("dedupe keys differ across redeliveries: %q vs %q",
+				first[0].DedupeKey(), second[0].DedupeKey())
+		}
+		other, err := adapter.Parse(header, reviewPayload("reviewed", "pull_request_review_comment", "different"), "BeanieGenie")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if other[0].DedupeKey() == first[0].DedupeKey() {
+			t.Errorf("different payloads hash to the same dedupe key %q", first[0].DedupeKey())
+		}
+	})
+
+	t.Run("delivery without a review object is ignored", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("X-Forgejo-Event", "pull_request_comment")
+		events, err := adapter.Parse(header, reviewPayload("reviewed", "", ""), "BeanieGenie")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(events) != 0 {
+			t.Errorf("got %d events, want 0", len(events))
+		}
+	})
+
+	t.Run("malformed payload fails", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("X-Forgejo-Event", "pull_request_comment")
+		if _, err := adapter.Parse(header, []byte("{not json"), "BeanieGenie"); err == nil {
+			t.Fatal("expected error for malformed review payload")
+		}
+	})
+}
+
 func TestForgejoParseIgnoresOtherEvents(t *testing.T) {
 	adapter := NewForgejoAdapter("forgejo")
 	for _, ev := range []string{"create", "pull_request", "repository", "release", ""} {
