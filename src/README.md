@@ -18,7 +18,8 @@ and cobra for the installer's command line):
   activities. It opens no inbound port and receives no webhooks; the
   listener starts the workflows.
 - **`cmd/install`** — the interactive installer that onboards a
-  repository (see [Installer](#installer)).
+  repository: it creates the webhook and records the repository in the
+  watched-repositories config (see [Installer](#installer)).
 
 Deployments that run agents point the repository webhooks at the listener
 and run the worker alongside it; the worker connects to the same Temporal
@@ -165,11 +166,38 @@ flags follow the usual precedence (flag, then environment variable,
 then the built-in default); a token passed as a flag is visible in the
 process list, so prefer the hidden prompt or `INSTALL_TOKEN`.
 
-The prompt flow lives in `internal/installer` over injectable input and
-output streams, so it is unit-tested without a terminal. Today the
-installer stops after collecting the answers and prints them; creating
-the webhook and writing the repository into the watched-repositories
-config file is the next step (TASK-27.4).
+After the answers, the installer connects the repository in two steps:
+
+1. **Creates the webhook** on the provider with a freshly generated
+   secret (32 random bytes, hex-encoded), targeting the listener's
+   webhook route `{listener}/v1/{project}/webhooks/{provider}`, where
+   `{project}` is the repository name. It subscribes to the events the
+   agents need: pushes, issue comments, merge request comments, and
+   merge request reviews — the same selection as the manual wiring
+   above.
+2. **Writes the repository entry** — project, the generated secret,
+   and the per-repo token — to the watched-repositories config file, so
+   the listener watches it. Restart the listener afterwards: it loads
+   the watched repositories at startup.
+
+It prints a summary naming the repository, the webhook URL, and the
+config file; the token and the secret are never printed. The webhook is
+created before the config is written, so a failed webhook creation
+leaves no config entry behind. If the config write fails, the error
+names the webhook that now exists on the repository, so it can be
+removed.
+
+| Flag | Environment variable | Default | Description |
+| ---- | -------------------- | ------- | ----------- |
+| `--forgejo-url` | `FORGEJO_URL` | `http://localhost:3000` | Forgejo/Gitea instance the webhook is created on |
+| `--listener-url` | `INSTALL_LISTENER_URL` | `http://localhost:9797` | Listener base URL webhook deliveries target (the address Forgejo can reach, e.g. `http://169.254.1.2:9797` under rootless podman) |
+| `--watched-config` | `WATCHED_CONFIG` | `watched.yaml` | Watched-repositories config file to write |
+| `--webhook-events` | `INSTALL_WEBHOOK_EVENTS` | the agent event set | Comma-separated webhook events to subscribe |
+
+The prompt flow and the onboarding steps live in `internal/installer`
+over injectable input and output streams and an injectable provider
+client, so the whole flow is unit-tested without a terminal or a live
+Forgejo.
 
 ### Temporal server
 
@@ -508,10 +536,12 @@ Webhook ──► cmd/listener ──► Temporal ──► cmd/worker
 cmd/listener            listener entry point: config, Temporal starter,
                         event bridge, logging consumer, HTTP server, lifecycle
 cmd/worker              worker entry point: config, Temporal workers, lifecycle
-cmd/install             installer entry point: cobra command, prompt flow wiring
-internal/installer      interactive onboarding prompt flow (provider, repository,
-                        access token) over injectable streams; no API calls yet
-internal/config         flag + env configuration (listener + worker)
+cmd/install             installer entry point: cobra command, config, provider
+                        client factory
+internal/installer      interactive onboarding over injectable streams: prompt
+                        flow (provider, repository, access token), webhook
+                        creation with a generated secret, watched-config write
+internal/config         flag + env configuration (listener, worker, installer)
 internal/configstore    declarative config store for watched repos: Store interface,
                         File (YAML/JSON config file, per-repo webhook secrets),
                         Static (in-memory); the seam a K8s operator/CRD plugs into
