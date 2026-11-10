@@ -394,6 +394,9 @@ the autonomous agents need:
   inline review comments with their file/line positions
   (`ListMergeRequestReviewComments` — Forgejo webhooks do not carry
   inline positions, so the comment loop resolves them through this).
+- **Webhooks**: register a repository webhook delivering the chosen
+  events, as JSON signed with a secret, to a target URL
+  (`CreateWebhook` — the seam the interactive installer uses).
 
 Repositories are addressed by full name (`root/BeanieGenie`); refs are
 branch names or commit SHAs, an empty ref meaning the default branch.

@@ -131,10 +131,24 @@ type Comment struct {
 	Line int
 }
 
+// Webhook is a repository webhook the provider delivers events to.
+type Webhook struct {
+	// ID identifies the webhook on the provider.
+	ID int64
+	// URL is the target address deliveries are sent to.
+	URL string
+	// Events are the provider's event names that trigger deliveries,
+	// e.g. "push" or "issue_comment".
+	Events []string
+	// Active reports whether the webhook is enabled and delivers.
+	Active bool
+}
+
 // Client abstracts the provider repository operations the autonomous
-// agents need. Implementations live in this package (ForgejoClient for
-// the real API, Fake for tests); activities and their tests depend on
-// this interface, so no provider API is called from test code.
+// agents and the installer need. Implementations live in this package
+// (ForgejoClient for the real API, Fake for tests); activities and
+// their tests depend on this interface, so no provider API is called
+// from test code.
 //
 // A Client serves every repository of one provider instance; each
 // operation names its repository. Repositories are addressed by their
@@ -187,4 +201,10 @@ type Client interface {
 	// AddMergeRequestComment adds a comment to a merge request and
 	// returns it.
 	AddMergeRequestComment(ctx context.Context, repo string, number int64, body string) (Comment, error)
+
+	// CreateWebhook registers a webhook on repo: the provider delivers
+	// the named events, as JSON signed with secret, to targetURL, and
+	// returns the created webhook. events are the provider's webhook
+	// event names, e.g. "push" or "issue_comment".
+	CreateWebhook(ctx context.Context, repo, targetURL, secret string, events []string) (Webhook, error)
 }

@@ -647,6 +647,96 @@ func TestForgejoClientMergeRequestReviewComments(t *testing.T) {
 	}
 }
 
+func TestForgejoClientCreateWebhook(t *testing.T) {
+	// The hook a Forgejo instance answers with, matching the shape of
+	// the live API: config carries the target URL, content type, and
+	// secret the hook was created with.
+	hook := map[string]any{
+		"id":   3,
+		"type": "gitea",
+		"url":  "http://test/api/v1/repos/root/test/hooks/3",
+		"config": map[string]any{
+			"url":          "http://169.254.1.2:9797/v1/test/webhooks/forgejo",
+			"content_type": "json",
+			"secret":       "s3cret",
+		},
+		"events": []string{"push", "issue_comment", "pull_request_comment"},
+		"active": true,
+	}
+	target := "http://169.254.1.2:9797/v1/test/webhooks/forgejo"
+	events := []string{"push", "issue_comment", "pull_request_comment"}
+
+	c, rec := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+		respondJSON(w, http.StatusCreated, hook)
+	})
+	created, err := c.CreateWebhook(context.Background(), "root/test", target, "s3cret", events)
+	if err != nil {
+		t.Fatalf("CreateWebhook: %v", err)
+	}
+	want := Webhook{ID: 3, URL: target, Events: events, Active: true}
+	if !reflect.DeepEqual(created, want) {
+		t.Errorf("webhook = %+v, want %+v", created, want)
+	}
+
+	got := rec.last()
+	if got.Method != http.MethodPost || got.Path != "/api/v1/repos/root/test/hooks" {
+		t.Errorf("request = %s %s, want POST /api/v1/repos/root/test/hooks", got.Method, got.Path)
+	}
+	if got.Auth != "token "+testToken {
+		t.Errorf("auth = %q, want %q", got.Auth, "token "+testToken)
+	}
+	var body createHookRequest
+	if err := json.Unmarshal([]byte(got.Body), &body); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if body.Type != "gitea" || !body.Active {
+		t.Errorf("body = %+v, want an active gitea hook", body)
+	}
+	if body.Config.URL != target || body.Config.ContentType != "json" || body.Config.Secret != "s3cret" {
+		t.Errorf("config = %+v, want target url, json content type, and the secret", body.Config)
+	}
+	if !reflect.DeepEqual(body.Events, events) {
+		t.Errorf("events = %v, want %v", body.Events, events)
+	}
+
+	t.Run("provider rejects", func(t *testing.T) {
+		c2, _ := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+			respondJSON(w, http.StatusUnprocessableEntity, forgejoError("hook with same name and target already exists"))
+		})
+		_, err := c2.CreateWebhook(context.Background(), "root/test", target, "s3cret", events)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnprocessableEntity {
+			t.Errorf("error = %v, want 422 APIError", err)
+		}
+	})
+
+	t.Run("missing repo", func(t *testing.T) {
+		c2, _ := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+			respondJSON(w, http.StatusNotFound, forgejoError("The target couldn't be found."))
+		})
+		if _, err := c2.CreateWebhook(context.Background(), "root/missing", target, "s3cret", events); !errors.Is(err, ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("input validation", func(t *testing.T) {
+		called := false
+		c2, _ := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			respondJSON(w, http.StatusCreated, hook)
+		})
+		if _, err := c2.CreateWebhook(context.Background(), "root/test", "", "s3cret", events); err == nil {
+			t.Error("empty target url accepted")
+		}
+		if _, err := c2.CreateWebhook(context.Background(), "root/test", target, "s3cret", nil); err == nil {
+			t.Error("missing events accepted")
+		}
+		if called {
+			t.Error("invalid input reached the API")
+		}
+	})
+}
+
 func TestForgejoClientAPIError(t *testing.T) {
 	c, _ := newTestForgejo(t, func(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusForbidden, forgejoError("token lacks scope"))

@@ -239,6 +239,88 @@ func TestFakeMergeRequestFlow(t *testing.T) {
 	})
 }
 
+func TestFakeCreateWebhook(t *testing.T) {
+	f := NewFake("root/BeanieGenie")
+	target := "http://169.254.1.2:9797/v1/BeanieGenie/webhooks/forgejo"
+	events := []string{"push", "issue_comment"}
+
+	hook, err := f.CreateWebhook(ctx(), "root/BeanieGenie", target, "s3cret", events)
+	if err != nil {
+		t.Fatalf("CreateWebhook: %v", err)
+	}
+	if hook.ID == 0 || hook.URL != target || !hook.Active {
+		t.Errorf("webhook = %+v, want an active webhook with id and target url", hook)
+	}
+	if !reflect.DeepEqual(hook.Events, events) {
+		t.Errorf("events = %v, want %v", hook.Events, events)
+	}
+
+	t.Run("records the call", func(t *testing.T) {
+		calls := f.WebhookCalls()
+		if len(calls) != 1 {
+			t.Fatalf("calls = %+v, want one recorded call", calls)
+		}
+		want := WebhookCall{Repo: "root/BeanieGenie", TargetURL: target, Secret: "s3cret", Events: events}
+		if !reflect.DeepEqual(calls[0], want) {
+			t.Errorf("call = %+v, want %+v", calls[0], want)
+		}
+	})
+
+	t.Run("stores the webhook on the repo", func(t *testing.T) {
+		hooks := f.Webhooks("root/BeanieGenie")
+		if len(hooks) != 1 || !reflect.DeepEqual(hooks[0], hook) {
+			t.Errorf("hooks = %+v, want the created %+v", hooks, hook)
+		}
+		if hooks := f.Webhooks("root/other"); hooks != nil {
+			t.Errorf("hooks = %+v, want none for an unknown repo", hooks)
+		}
+	})
+
+	t.Run("second webhook gets a new id", func(t *testing.T) {
+		second, err := f.CreateWebhook(ctx(), "root/BeanieGenie", "http://other:9797/hook", "s3cret", []string{"push"})
+		if err != nil {
+			t.Fatalf("CreateWebhook: %v", err)
+		}
+		if second.ID == hook.ID {
+			t.Errorf("id = %d, want a fresh id", second.ID)
+		}
+		if hooks := f.Webhooks("root/BeanieGenie"); len(hooks) != 2 {
+			t.Errorf("hooks = %+v, want both webhooks", hooks)
+		}
+	})
+
+	t.Run("returned records are copies", func(t *testing.T) {
+		hooks := f.Webhooks("root/BeanieGenie")
+		hooks[0].URL = "mutated"
+		if again := f.Webhooks("root/BeanieGenie"); again[0].URL == "mutated" {
+			t.Error("Webhooks leaked its internal slice")
+		}
+		calls := f.WebhookCalls()
+		calls[0].Secret = "mutated"
+		if again := f.WebhookCalls(); again[0].Secret == "mutated" {
+			t.Error("WebhookCalls leaked its internal slice")
+		}
+	})
+
+	t.Run("missing repo", func(t *testing.T) {
+		if _, err := f.CreateWebhook(ctx(), "root/missing", target, "s3cret", events); !errors.Is(err, ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("input validation", func(t *testing.T) {
+		if _, err := f.CreateWebhook(ctx(), "root/BeanieGenie", "", "s3cret", events); err == nil {
+			t.Error("empty target url accepted")
+		}
+		if _, err := f.CreateWebhook(ctx(), "root/BeanieGenie", target, "s3cret", nil); err == nil {
+			t.Error("missing events accepted")
+		}
+		if calls := f.WebhookCalls(); len(calls) != 2 {
+			t.Errorf("calls = %d, want 2 (invalid input is not recorded)", len(calls))
+		}
+	})
+}
+
 func TestFakeErr(t *testing.T) {
 	injected := errors.New("provider unavailable")
 	f := NewFake("root/BeanieGenie")
@@ -268,6 +350,9 @@ func TestFakeErr(t *testing.T) {
 	}
 	if _, err := f.AddMergeRequestComment(ctx, "root/BeanieGenie", 1, "x"); !errors.Is(err, injected) {
 		t.Errorf("AddMergeRequestComment error = %v, want injected", err)
+	}
+	if _, err := f.CreateWebhook(ctx, "root/BeanieGenie", "http://target", "s3cret", []string{"push"}); !errors.Is(err, injected) {
+		t.Errorf("CreateWebhook error = %v, want injected", err)
 	}
 }
 

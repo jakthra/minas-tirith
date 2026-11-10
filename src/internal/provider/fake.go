@@ -25,8 +25,21 @@ type Fake struct {
 	// error handling.
 	Err error
 
-	mu    sync.Mutex
-	repos map[string]*fakeRepo
+	mu           sync.Mutex
+	repos        map[string]*fakeRepo
+	webhookCalls []WebhookCall
+}
+
+// WebhookCall is one CreateWebhook call, as recorded by WebhookCalls.
+type WebhookCall struct {
+	// Repo is the repository the webhook was created on.
+	Repo string
+	// TargetURL is the address deliveries are sent to.
+	TargetURL string
+	// Secret signs the deliveries.
+	Secret string
+	// Events are the event names that trigger deliveries.
+	Events []string
 }
 
 // fakeRepo is one repository held by a Fake.
@@ -37,6 +50,7 @@ type fakeRepo struct {
 	mergeRequests  map[int64]MergeRequest
 	comments       map[int64][]Comment
 	reviewComments map[int64][]Comment
+	webhooks       []Webhook
 	nextNumber     int64
 	nextSHA        int
 }
@@ -355,6 +369,64 @@ func (f *Fake) AddMergeRequestComment(_ context.Context, repo string, number int
 	}
 	r.comments[number] = append(r.comments[number], comment)
 	return comment, nil
+}
+
+// CreateWebhook implements Client, recording the call (WebhookCalls) so
+// tests verify the repo, target URL, secret, and events an installer
+// passed.
+func (f *Fake) CreateWebhook(_ context.Context, repo, targetURL, secret string, events []string) (Webhook, error) {
+	if err := f.op(); err != nil {
+		return Webhook{}, err
+	}
+	if strings.TrimSpace(targetURL) == "" {
+		return Webhook{}, errors.New("webhook target url is required")
+	}
+	if len(events) == 0 {
+		return Webhook{}, errors.New("webhook events are required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.repos[repo]
+	if !ok {
+		return Webhook{}, fmt.Errorf("%w: repository %s", ErrNotFound, repo)
+	}
+	f.webhookCalls = append(f.webhookCalls, WebhookCall{
+		Repo:      repo,
+		TargetURL: targetURL,
+		Secret:    secret,
+		Events:    append([]string(nil), events...),
+	})
+	hook := Webhook{
+		ID:     int64(len(r.webhooks) + 1),
+		URL:    targetURL,
+		Events: append([]string(nil), events...),
+		Active: true,
+	}
+	r.webhooks = append(r.webhooks, hook)
+	return hook, nil
+}
+
+// Webhooks returns the webhooks created on repo, in creation order, for
+// tests.
+func (f *Fake) Webhooks(repo string) []Webhook {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.repos[repo]
+	if !ok {
+		return nil
+	}
+	out := make([]Webhook, len(r.webhooks))
+	copy(out, r.webhooks)
+	return out
+}
+
+// WebhookCalls returns every CreateWebhook call in order, for tests.
+func (f *Fake) WebhookCalls() []WebhookCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]WebhookCall, len(f.webhookCalls))
+	copy(out, f.webhookCalls)
+	return out
 }
 
 // op applies the injected error, if any.

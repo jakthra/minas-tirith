@@ -260,6 +260,34 @@ func (c *ForgejoClient) AddMergeRequestComment(ctx context.Context, repo string,
 	return commentFrom(resp), nil
 }
 
+// CreateWebhook implements Client. The hook type is "gitea" — the type
+// both Forgejo and Gitea instances accept — and deliveries are JSON
+// bodies signed with the secret, the format the listener's Forgejo
+// adapter verifies.
+func (c *ForgejoClient) CreateWebhook(ctx context.Context, repo, targetURL, secret string, events []string) (Webhook, error) {
+	if strings.TrimSpace(targetURL) == "" {
+		return Webhook{}, errors.New("webhook target url is required")
+	}
+	if len(events) == 0 {
+		return Webhook{}, errors.New("webhook events are required")
+	}
+	path, err := repoPath(repo, "hooks")
+	if err != nil {
+		return Webhook{}, err
+	}
+	body := createHookRequest{
+		Type:   "gitea",
+		Active: true,
+		Events: events,
+		Config: hookConfig{URL: targetURL, ContentType: "json", Secret: secret},
+	}
+	var resp hookResponse
+	if err := c.do(ctx, http.MethodPost, path, nil, body, &resp); err != nil {
+		return Webhook{}, err
+	}
+	return webhookFrom(resp), nil
+}
+
 // --- HTTP plumbing ---
 
 // do performs one API request against /api/v1: body (when non-nil) is
@@ -456,6 +484,41 @@ type commentResponse struct {
 
 type createIssueCommentRequest struct {
 	Body string `json:"body"`
+}
+
+// createHookRequest is the Forgejo repo-hooks creation payload: a gitea
+// webhook delivering JSON bodies to one target URL, signed with the
+// secret.
+type createHookRequest struct {
+	Type   string     `json:"type"`
+	Config hookConfig `json:"config"`
+	Events []string   `json:"events"`
+	Active bool       `json:"active"`
+}
+
+type hookConfig struct {
+	URL         string `json:"url"`
+	ContentType string `json:"content_type"`
+	Secret      string `json:"secret"`
+}
+
+type hookResponse struct {
+	ID     int64    `json:"id"`
+	Type   string   `json:"type"`
+	Events []string `json:"events"`
+	Active bool     `json:"active"`
+	Config struct {
+		URL string `json:"url"`
+	} `json:"config"`
+}
+
+func webhookFrom(resp hookResponse) Webhook {
+	return Webhook{
+		ID:     resp.ID,
+		URL:    resp.Config.URL,
+		Events: resp.Events,
+		Active: resp.Active,
+	}
 }
 
 func commentFrom(resp commentResponse) Comment {
