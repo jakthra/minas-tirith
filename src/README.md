@@ -101,6 +101,7 @@ secret:
 repos:
   - project: BeanieGenie
     secret: s3cret
+    token: beanie-forgejo-token
   - project: Garden
     secret: another-secret
 ```
@@ -111,6 +112,11 @@ repos:
 - `secret` is that repository's webhook secret: deliveries are verified
   with the secret of the project they are addressed to, so every
   repository can have its own. There is no shared fallback.
+- `token` is that repository's own provider access token, used for
+  provider API calls on its behalf (reading and writing repository
+  content, creating webhooks). It is optional — the listener only needs
+  the webhook secret — and, like the secret, per repository with no
+  shared fallback.
 
 A config file that declares no repositories, or entries without a
 project or secret, fails startup with every problem listed at once.

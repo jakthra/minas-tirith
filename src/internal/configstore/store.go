@@ -21,6 +21,12 @@ type Repository struct {
 	// deliveries. Each repository carries its own secret; there is no
 	// shared fallback.
 	Secret string
+
+	// Token is the repository's own provider access token, used for
+	// provider API calls on its behalf (reading and writing repository
+	// content, creating webhooks). It is optional — the listener only
+	// needs the webhook secret — and there is no shared fallback token.
+	Token string
 }
 
 // Store loads watched repositories and their webhook secrets from a
