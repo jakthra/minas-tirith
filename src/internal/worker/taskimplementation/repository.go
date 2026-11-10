@@ -305,6 +305,79 @@ func (a *Activities) ListRepository(ctx context.Context, in ListRepositoryInput)
 	return listing, nil
 }
 
+// SearchRepositoryInput is the input to the SearchRepository activity.
+type SearchRepositoryInput struct {
+	// Repository is the provider full repo name.
+	Repository string `json:"repository"`
+	// Query is a case-insensitive substring of the file path to find.
+	Query string `json:"query"`
+	// Ref is the branch or commit to search; empty means the
+	// repository's default branch.
+	Ref string `json:"ref"`
+}
+
+// SearchResult is the result of the SearchRepository activity.
+type SearchResult struct {
+	// Files lists the matching files, sorted by path.
+	Files []FileEntry `json:"files"`
+	// Total is the number of matching files before the result was
+	// bounded.
+	Total int `json:"total"`
+	// Truncated reports that Files holds only the first
+	// maxContextSearchMatches matches of Total, or that the listing the
+	// search ran over was itself truncated by maxListedFiles (so the
+	// search may miss files).
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// SearchRepository finds the repository files whose path contains query,
+// case-insensitively. It is a listing-based search — the provider client
+// has no search operation — so it runs over the same bounded listing
+// ListRepository returns; Truncated reports both a bounded result and a
+// bounded listing, so a search is never silently incomplete. An empty
+// query fails the activity. It runs as a Temporal activity so the
+// provider API call stays out of the workflow body.
+func (a *Activities) SearchRepository(ctx context.Context, in SearchRepositoryInput) (SearchResult, error) {
+	if err := a.requireProvider("SearchRepository"); err != nil {
+		return SearchResult{}, err
+	}
+	if err := validateRepository(in.Repository); err != nil {
+		return SearchResult{}, err
+	}
+	query := strings.ToLower(strings.TrimSpace(in.Query))
+	if query == "" {
+		return SearchResult{}, errors.New("search repository: query is required")
+	}
+	if activity.IsActivity(ctx) {
+		logger := activity.GetLogger(ctx)
+		logger.Info("searching repository files",
+			"repository", in.Repository, "query", query, "ref", in.Ref)
+	}
+
+	infos, err := a.provider.ListFiles(ctx, in.Repository, "", in.Ref)
+	if err != nil {
+		return SearchResult{}, fmt.Errorf("search %q in %s at %s: %w", query, in.Repository, in.Ref, err)
+	}
+	result := SearchResult{Files: make([]FileEntry, 0, min(len(infos), maxContextSearchMatches))}
+	for _, info := range infos {
+		if !strings.Contains(strings.ToLower(info.Path), query) {
+			continue
+		}
+		result.Total++
+		if len(result.Files) == maxContextSearchMatches {
+			result.Truncated = true
+			continue
+		}
+		result.Files = append(result.Files, FileEntry{Path: info.Path, Size: info.Size})
+	}
+	if len(infos) > maxListedFiles {
+		// The listing the search ran over was bounded, so files past
+		// the bound were not searched.
+		result.Truncated = true
+	}
+	return result, nil
+}
+
 // ReadFilesInput is the input to the ReadFiles activity.
 type ReadFilesInput struct {
 	// Repository is the provider full repo name.

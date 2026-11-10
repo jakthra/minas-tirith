@@ -15,6 +15,7 @@
 package taskimplementation
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"minas-tirith/internal/llm"
 	"minas-tirith/internal/provider"
 	"minas-tirith/internal/worker/backlog"
 )
@@ -51,9 +53,16 @@ const (
 	// ReadFilesName is the Temporal activity type name for the activity
 	// that reads source files at a ref.
 	ReadFilesName = "taskImplementation.readFiles"
+	// SearchRepositoryName is the Temporal activity type name for the
+	// activity that searches the repository files by path.
+	SearchRepositoryName = "taskImplementation.searchRepository"
+	// RequestContextName is the Temporal activity type name for the
+	// activity that runs one round of the context conversation: the
+	// model's repository context requests, or its implementation.
+	RequestContextName = "taskImplementation.requestContext"
 	// GenerateImplementationName is the Temporal activity type name for
 	// the activity that asks the LLM to implement the task against the
-	// repository context.
+	// repository context, in the final propose-only round.
 	GenerateImplementationName = "taskImplementation.generateImplementation"
 	// CreateImplementationBranchName is the Temporal activity type name
 	// for the activity that creates the implementation branch from the
@@ -161,6 +170,13 @@ type TaskImplementation struct {
 	// PromptVersion is the implementation prompt version that produced
 	// the changes.
 	PromptVersion string `json:"prompt_version,omitempty"`
+	// ContextRounds is the number of context request rounds the model ran
+	// before it proposed the implementation.
+	ContextRounds int `json:"context_rounds,omitempty"`
+	// ContextRefusals are the context requests the aggregate context
+	// budget refused; a partial outcome names them so a context-starved
+	// result is not misreported as missing information.
+	ContextRefusals []ContextRefusal `json:"context_refusals,omitempty"`
 	// MergeRequest is the merge request carrying this implementation: a
 	// regular MR for a complete one, a draft MR with a refiner hand-off
 	// for a partial one. Nil when the MR could not be opened.
@@ -189,9 +205,11 @@ type MergeRequestSubmission struct {
 //
 // It validates the input, keeps the task files the shared backlog
 // classification assigned to it, and for every task: reads the task at
-// the commit, lists the repository, reads the files the task is likely to
-// touch, asks the LLM to implement it, and commits the proposed changes
-// to an implement/<task-slug>-<short-sha> branch. It then opens the merge
+// the commit, lists the repository, seeds the context with the files the
+// task is likely to touch, lets the model request more context until it
+// proposes (bounded by maxContextRounds and maxContextBudgetBytes), asks
+// the LLM to implement it, and commits the proposed changes to an
+// implement/<task-slug>-<short-sha> branch. It then opens the merge
 // request carrying each implementation — a regular MR for a complete one,
 // a draft MR for a partial one, handed to the refiner agent on the MR.
 //
@@ -311,11 +329,14 @@ func submitImplementation(ctx workflow.Context, in Input, impl TaskImplementatio
 	}, nil
 }
 
-// implementTask implements one backlog task: read it, gather the
-// repository context, generate the changes, and commit them to the task's
-// implementation branch. It returns the task's outcome, including a
-// partial one, and an error only when a step failed (so Temporal retries
-// that step).
+// implementTask implements one backlog task: read it, seed the
+// repository context from it, let the model request more context until it
+// proposes the changes (bounded by maxContextRounds and
+// maxContextBudgetBytes), generate the implementation, and commit it to
+// the task's implementation branch. It returns the task's outcome,
+// including a partial one, and an error only when a step failed (so
+// Temporal retries that step). The context bounds never fail the run:
+// they produce a partial outcome naming the bound.
 func implementTask(ctx workflow.Context, in Input, path string) (TaskImplementation, error) {
 	logger := workflow.GetLogger(ctx)
 
@@ -336,42 +357,128 @@ func implementTask(ctx workflow.Context, in Input, path string) (TaskImplementat
 		return TaskImplementation{}, fmt.Errorf("list repository for %s: %w", path, err)
 	}
 
-	// Read the files the task is most likely to touch: the files it
-	// names, then the files near its own path. The model sees the
-	// listing for everything else and reports a partial outcome when it
-	// needs a file that was not read.
-	relevant := relevantFiles(task, listing.Files, path)
+	// Seed the context from the task with the TASK-23 heuristic: the
+	// files the task names, then the files near the top of the listing.
+	// A task that names its files needs no request round.
+	seed := seedContext(task, listing, path)
 	var contents []ReadFile
-	if len(relevant) > 0 {
+	if len(seed) > 0 {
 		if err := workflow.ExecuteActivity(ctx, ReadFilesName, ReadFilesInput{
 			Repository: in.Repository,
-			Paths:      relevant,
+			Paths:      seed,
 			Ref:        in.SHA,
 		}).Get(ctx, &contents); err != nil {
 			return TaskImplementation{}, fmt.Errorf("read files for %s: %w", path, err)
 		}
 	}
+	repoContext := Context{Files: listing.Files, Truncated: listing.Truncated, Total: listing.Total}
+	repoContext.mergeFiles(contents)
 
-	var impl Implementation
-	if err := workflow.ExecuteActivity(ctx, GenerateImplementationName, GenerateImplementationInput{
+	// The context conversation: the seed prompt first, then one
+	// request round per LLM call that may issue context requests. The
+	// loop is deterministic — every LLM and provider call is an activity
+	// and the history is rebuilt from activity results — and bounded:
+	// at most maxContextRounds request rounds, then a propose-only round
+	// that cannot issue requests.
+	history := []llm.Message{{Role: llm.RoleUser, Content: seedPrompt(GenerateImplementationInput{
 		Repository: in.Repository,
 		Ref:        in.SHA,
 		Task:       task,
-		Files:      listing.Files,
-		Contents:   contents,
-		Truncated:  listing.Truncated,
+		Context:    repoContext,
+	})}}
+	var refusals []ContextRefusal
+	rounds := 0
+	roundBoundReached := false
+	for rounds < maxContextRounds {
+		var round ContextRound
+		if err := workflow.ExecuteActivity(ctx, RequestContextName, RequestContextInput{
+			Repository:  in.Repository,
+			Ref:         in.SHA,
+			Task:        task,
+			Context:     repoContext,
+			History:     history,
+			Round:       rounds + 1,
+			MaxRounds:   maxContextRounds,
+			BudgetBytes: maxContextBudgetBytes,
+		}).Get(ctx, &round); err != nil {
+			return TaskImplementation{}, fmt.Errorf("request context for %s: %w", path, err)
+		}
+		if round.Implementation != nil {
+			return finishImplementation(ctx, in, task, path, *round.Implementation, rounds, refusals, false)
+		}
+		rounds++
+		refused, err := executeContextRequests(ctx, in, task, &repoContext, round.Requests)
+		if err != nil {
+			return TaskImplementation{}, fmt.Errorf("execute context requests for %s: %w", path, err)
+		}
+		refusals = append(refusals, refused...)
+		for _, r := range refused {
+			repoContext.note("refused for budget: " + r.String())
+		}
+		history = append(history,
+			llm.Message{Role: llm.RoleAssistant, Content: requestReplyContent(round.Requests)},
+			llm.Message{Role: llm.RoleUser, Content: contextResultsPrompt(round.Requests, repoContext, refusals)},
+		)
+		logger.Info("implementation context round",
+			"task", task.ID, "round", rounds, "requests", len(round.Requests),
+			"refused", len(refused), "files", len(repoContext.Contents),
+			"context_bytes", repoContext.Bytes())
+	}
+	if rounds == maxContextRounds {
+		roundBoundReached = true
+		logger.Info("implementation context round bound reached",
+			"task", task.ID, "rounds", rounds, "bound", maxContextRounds)
+	}
+
+	// The final, propose-only round: it replays the conversation and
+	// cannot issue requests, so a missing-context partial is only
+	// reported after the model has had the chance to request the files.
+	var impl Implementation
+	if err := workflow.ExecuteActivity(ctx, GenerateImplementationName, GenerateImplementationInput{
+		Repository:        in.Repository,
+		Ref:               in.SHA,
+		Task:              task,
+		Context:           repoContext,
+		History:           history,
+		Refusals:          refusals,
+		RoundBoundReached: roundBoundReached,
 	}).Get(ctx, &impl); err != nil {
 		return TaskImplementation{}, fmt.Errorf("generate implementation for %s: %w", path, err)
 	}
+	return finishImplementation(ctx, in, task, path, impl, rounds, refusals, roundBoundReached)
+}
+
+// finishImplementation turns the model's implementation into the task's
+// outcome: it applies the context bounds to a partial outcome, creates
+// the implementation branch from the task commit, and commits the
+// proposed changes to it — each its own activity, so a retry re-runs only
+// the step that failed. The branch is created only after the context loop
+// and the generation, so a context storm cannot leave orphan branches.
+func finishImplementation(ctx workflow.Context, in Input, task Task, path string, impl Implementation, rounds int, refusals []ContextRefusal, roundBoundReached bool) (TaskImplementation, error) {
+	logger := workflow.GetLogger(ctx)
+
+	impl.ContextRounds = rounds
+	impl.ContextRefusals = refusals
+	if impl.PromptVersion == "" {
+		// The activity reports its prompt version; keep the outcome
+		// traceable even when a substitute did not set one.
+		impl.PromptVersion = ImplementationPromptVersion
+	}
+	impl.RoundBoundReached = roundBoundReached
+	if !impl.Complete {
+		impl.Reason = contextBoundReason(impl.Reason, refusals, roundBoundReached)
+	}
 
 	result := TaskImplementation{
-		TaskPath:      path,
-		TaskID:        task.ID,
-		TaskTitle:     task.Title,
-		Complete:      impl.Complete,
-		Reason:        impl.Reason,
-		OpenQuestions: impl.OpenQuestions,
-		PromptVersion: impl.PromptVersion,
+		TaskPath:        path,
+		TaskID:          task.ID,
+		TaskTitle:       task.Title,
+		Complete:        impl.Complete,
+		Reason:          impl.Reason,
+		OpenQuestions:   impl.OpenQuestions,
+		PromptVersion:   impl.PromptVersion,
+		ContextRounds:   impl.ContextRounds,
+		ContextRefusals: impl.ContextRefusals,
 	}
 
 	// Create the implementation branch from the task commit, then commit
@@ -416,8 +523,73 @@ func implementTask(ctx workflow.Context, in Input, path string) (TaskImplementat
 	logger.Info("task implemented",
 		"task", task.ID, "complete", impl.Complete,
 		"branch", branch.Name, "commit", ShortSHA(commit.SHA),
-		"files", len(commit.Files))
+		"files", len(commit.Files), "context_rounds", rounds)
 	return result, nil
+}
+
+// contextBoundReason folds the context bounds into a partial outcome's
+// reason, so a context-starved result is never misreported as missing
+// information: the round bound and every request the budget refused are
+// named.
+func contextBoundReason(reason string, refusals []ContextRefusal, roundBoundReached bool) string {
+	var bounds []string
+	if roundBoundReached {
+		bounds = append(bounds, fmt.Sprintf("the context round bound (%d rounds) was reached before the model proposed", maxContextRounds))
+	}
+	if len(refusals) > 0 {
+		requests := make([]string, 0, len(refusals))
+		for _, r := range refusals {
+			requests = append(requests, r.Request.String())
+		}
+		bounds = append(bounds, fmt.Sprintf("the context budget (%d bytes) refused %d request(s): %s",
+			maxContextBudgetBytes, len(refusals), strings.Join(requests, "; ")))
+	}
+	if len(bounds) == 0 {
+		return reason
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return strings.Join(bounds, "; ")
+	}
+	return reason + " (context bound: " + strings.Join(bounds, "; ") + ")"
+}
+
+// requestReplyContent renders a request round's reply as the assistant
+// turn of the context conversation, in the reply's JSON shape, so the
+// model sees its own requests in the next round.
+func requestReplyContent(requests []ContextRequest) string {
+	payload, err := json.Marshal(ImplementationReply{Outcome: string(OutcomeRequest), Requests: requests})
+	if err != nil {
+		// ImplementationReply is always encodable; fall back to the
+		// rendered requests so the history stays non-empty.
+		parts := make([]string, 0, len(requests))
+		for _, r := range requests {
+			parts = append(parts, r.String())
+		}
+		return "request: " + strings.Join(parts, "; ")
+	}
+	return string(payload)
+}
+
+// contextResultsPrompt renders the user turn that reports the results of
+// one round's context requests: what the requests added, what the budget
+// refused, and the context as it now stands.
+func contextResultsPrompt(requests []ContextRequest, c Context, refusals []ContextRefusal) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## Results of your %d context request(s)\n\n", len(requests))
+	if len(c.Notes) == 0 {
+		b.WriteString("(no new context)\n\n")
+	} else {
+		for _, note := range c.Notes {
+			b.WriteString("- ")
+			b.WriteString(note)
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	writeRefusals(&b, refusals)
+	b.WriteString(renderContext(c, ""))
+	return b.String()
 }
 
 // commitMessage is the implementation commit's message: the task id and
@@ -433,14 +605,16 @@ func commitMessage(task Task, impl Implementation) string {
 	return message
 }
 
-// relevantFiles picks the files to read for a task: the files the task
-// content names, then the files near the task's own directory, bounded by
-// maxContextFiles and by maxContextFileBytes per file. It never includes
-// the task file itself, and it is deterministic (the listing is sorted),
-// so a replayed workflow sends the model the same context.
-func relevantFiles(task Task, files []FileEntry, taskPath string) []string {
+// seedContext picks the files the first prompt reads for a task: the
+// files the task content names, then the files near the top of the
+// listing, bounded by maxContextFiles and by maxContextFileBytes per
+// file. It never includes the task file itself, and it is deterministic
+// (the listing is sorted), so a replayed workflow sends the model the
+// same seed. The seed is only the start: the model requests whatever else
+// the task needs (see context.go).
+func seedContext(task Task, listing RepositoryListing, taskPath string) []string {
 	named := make(map[string]bool)
-	for _, f := range files {
+	for _, f := range listing.Files {
 		if f.Path != taskPath && strings.Contains(task.Content, f.Path) {
 			named[f.Path] = true
 		}
@@ -457,12 +631,12 @@ func relevantFiles(task Task, files []FileEntry, taskPath string) []string {
 		}
 		paths = append(paths, f.Path)
 	}
-	for _, f := range files {
+	for _, f := range listing.Files {
 		if named[f.Path] {
 			appendFile(f)
 		}
 	}
-	for _, f := range files {
+	for _, f := range listing.Files {
 		appendFile(f)
 	}
 	return paths

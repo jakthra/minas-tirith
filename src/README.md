@@ -387,12 +387,14 @@ workflows; the worker executes them.
   modify a backlog task start it with the commit's payload and the task
   paths the shared backlog routing found, so a story-only commit never
   starts it. For every task the workflow reads the task at the commit,
-  lists the repository, reads the files the task is likely to touch, and
-  asks the LLM to implement it with the versioned implementation prompt
-  (`prompt.go`, `ImplementationPromptVersion`). The model answers with a
-  structured outcome — a complete implementation, or a partial one with
-  its reason and open questions — and the proposed file changes, which
-  the workflow commits to an `implement/<task-slug>-<short-sha>` branch.
+  lists the repository, seeds the context with the files the task is
+  likely to touch, lets the model request more repository context until
+  it proposes (the bounded context loop, see below), and asks the LLM to
+  implement it with the versioned implementation prompt (`prompt.go`,
+  `ImplementationPromptVersion`). The model answers with a structured
+  outcome — a complete implementation, or a partial one with its reason
+  and open questions — and the proposed file changes, which the workflow
+  commits to an `implement/<task-slug>-<short-sha>` branch.
   The result reports per task whether the implementation is complete or
   partial, the branch, the changed files, and the reason when partial;
   a partial implementation with no safe change still gets its branch, so
@@ -405,10 +407,39 @@ workflows; the worker executes them.
     decides this before the workflow starts; story-only commits start
     the review agent instead, and commits on any agent branch
     (`refine/*`, `implement/*`) start neither.
-  - **Prompt**: the versioned `ImplementationPrompt` — implement the
-    task against the repository code it is shown, respect every
-    acceptance criterion, and report either a `complete` outcome or a
-    `partial` one with a reason and open questions.
+  - **Context protocol** (TASK-26): the model selects its own
+    repository context instead of receiving a fixed slice. Each reply is
+    one JSON object parsed by `ChatJSON` (the LLM client is single-shot;
+    native tool calling is a deliberate follow-up). A reply with
+    `"outcome": "request"` carries context requests the workflow
+    executes through the repository tooling activities and feeds back:
+    `{"kind": "list", "path": "src/worker"}` lists a directory,
+    `{"kind": "search", "query": "slog"}` finds files whose path
+    contains the query (`SearchRepository`, a listing-based search), and
+    `{"kind": "read", "paths": ["src/a.go"]}` reads specific files (a
+    missing file is reported, not fatal). The first prompt is seeded
+    with the TASK-23 heuristic — the files the task names, then the top
+    of the listing — so a task that names its files needs no extra
+    rounds.
+  - **Context bounds**: the loop runs at most `maxContextRounds` (3)
+    request rounds, then one propose-only round that cannot issue
+    requests; the context as a whole is bounded by
+    `maxContextBudgetBytes` (4 MiB), on top of the per-file
+    (`maxContextFileBytes`, 64 KiB) and per-seed-file
+    (`maxContextFiles`, 40) limits. A request that would exceed the
+    budget is refused, and the model is told which requests were
+    refused. Neither bound fails the run: the round bound and the
+    refused requests are named in a partial outcome's reason (and in
+    `TaskImplementation.ContextRefusals`), so a context-starved result
+    is never misreported as missing information. The prompt states that
+    a missing-context partial is valid only after requests were tried.
+    Every request runs as an activity, so the workflow body stays
+    deterministic, and the branch is created only after the loop.
+  - **Prompt**: the versioned `ImplementationPrompt`
+    (`task-implementation/v2`) — inspect the repository until the task
+    can be implemented, implement it against the code it is shown,
+    respect every acceptance criterion, and report either a `complete`
+    outcome or a `partial` one with a reason and open questions.
   - **Branch**: the changes are committed to
     `implement/<task-slug>-<short-sha>`, branched from the task commit.
   - **MR**: a **complete** implementation opens a regular merge request
@@ -492,9 +523,12 @@ the operations the autonomous agents need:
 - **Chat**: send a system prompt and the conversation history (user and
   assistant turns), get the model's reply (`Chat`).
 - **Structured JSON**: ask for a single JSON object and have the reply
-  parsed into a Go value (`ChatJSON`) — the mode ticket generation uses
-  for reliable parsing, with fenced or prose-wrapped replies still
-  parsed.
+  parsed into a Go value (`ChatJSON`) — the mode ticket generation and
+  the implementation agent's context protocol use for reliable parsing,
+  with fenced or prose-wrapped replies still parsed. The client has no
+  native tool calling: the implementation agent's tools are structured
+  JSON requests the workflow executes as activities (see the context
+  protocol above).
 
 Authentication is the provider API key (`Authorization: Bearer`); the
 worker is configured through `LLM_BASE_URL`, `LLM_API_KEY`, and
@@ -571,12 +605,14 @@ internal/worker         Temporal execution layer: template registry, starter
                         files as task or user story (frontmatter), one
                         decision both agents route through
   └─ taskimplementation  second agent template: taskImplementationWorkflow
-                        (TASK-3 implementation agent, TASK-19/23/24): a commit
-                        that adds or modifies a backlog task is read, the
-                        repository inspected, the task implemented with the
-                        LLM, the changes committed to an implement/* branch,
-                        and the MR opened — a regular MR when complete, a
-                        draft MR with a refiner hand-off when partial
+                        (TASK-3 implementation agent, TASK-19/23/24/26): a
+                        commit that adds or modifies a backlog task is read,
+                        the repository inspected (the model requests its own
+                        context within bounded rounds and budget), the task
+                        implemented with the LLM, the changes committed to an
+                        implement/* branch, and the MR opened — a regular MR
+                        when complete, a draft MR with a refiner hand-off
+                        when partial
 ```
 
 Detection goes through the pluggable `source.EventSource` abstraction: the

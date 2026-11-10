@@ -25,8 +25,9 @@ import (
 // told to report a partial outcome when it needs the rest.
 const maxContextFileBytes = 64 << 10
 
-// maxContextFiles bounds how many files one GenerateImplementation call
-// sends, keeping the prompt within the model's context window.
+// maxContextFiles bounds how many files the seed context reads, keeping
+// the first prompt within the model's context window. Later rounds are
+// bounded by maxContextBudgetBytes instead (see context.go).
 const maxContextFiles = 40
 
 // ImplementationChange is one file the model proposes to write: the
@@ -48,14 +49,22 @@ type GenerateImplementationInput struct {
 	Ref string `json:"ref"`
 	// Task is the backlog task to implement.
 	Task Task `json:"task"`
-	// Files lists the repository's files (the relevant ones, or the
-	// whole listing when nothing narrower could be chosen).
-	Files []FileEntry `json:"files,omitempty"`
-	// Contents are the existing contents of the relevant files.
-	Contents []ReadFile `json:"contents,omitempty"`
-	// Truncated reports that Files is only part of the repository
-	// listing.
-	Truncated bool `json:"truncated,omitempty"`
+	// Context is the repository context assembled for the task: the seed
+	// chosen from the task, plus everything the model requested in the
+	// context rounds.
+	Context Context `json:"context"`
+	// History is the context conversation the rounds produced, when the
+	// workflow ran any: the seed prompt, then each request round's reply
+	// and its results. The final propose-only round replays it so the
+	// model sees everything it requested.
+	History []llm.Message `json:"history,omitempty"`
+	// Refusals are the context requests the budget refused, so the model
+	// knows what it was denied when it decides the context is missing.
+	Refusals []ContextRefusal `json:"refusals,omitempty"`
+	// RoundBoundReached reports that the model exhausted its context
+	// request rounds without proposing, so this is the propose-only
+	// round after the round bound.
+	RoundBoundReached bool `json:"round_bound_reached,omitempty"`
 }
 
 // Implementation is the result of the GenerateImplementation activity:
@@ -76,6 +85,17 @@ type Implementation struct {
 	// PromptVersion is the implementation prompt version that
 	// produced the result.
 	PromptVersion string `json:"prompt_version"`
+	// ContextRounds is the number of context request rounds the model
+	// ran before it proposed the implementation.
+	ContextRounds int `json:"context_rounds,omitempty"`
+	// ContextRefusals are the context requests the budget refused; the
+	// workflow reports them in a partial outcome so a context-starved
+	// result is not misreported as missing information.
+	ContextRefusals []ContextRefusal `json:"context_refusals,omitempty"`
+	// RoundBoundReached reports that the model used every context
+	// request round without proposing, so the implementation was
+	// proposed in the propose-only round after the round bound.
+	RoundBoundReached bool `json:"round_bound_reached,omitempty"`
 	// Model is the model that answered, as the provider reports it.
 	Model string `json:"model,omitempty"`
 }
@@ -99,12 +119,14 @@ func (a *Activities) GenerateImplementation(ctx context.Context, in GenerateImpl
 		logger := activity.GetLogger(ctx)
 		logger.Info("generating implementation",
 			"task", in.Task.ID, "repository", in.Repository, "ref", ShortSHA(in.Ref),
-			"files", len(in.Files), "contents", len(in.Contents))
+			"files", len(in.Context.Files), "contents", len(in.Context.Contents),
+			"rounds", len(in.History)/2, "refusals", len(in.Refusals))
 	}
 
-	messages := []llm.Message{
-		{Role: llm.RoleUser, Content: implementationUserPrompt(in)},
-	}
+	messages := append(append([]llm.Message(nil), in.History...), llm.Message{
+		Role:    llm.RoleUser,
+		Content: implementationUserPrompt(in),
+	})
 	var reply ImplementationReply
 	resp, err := a.llm.ChatJSON(ctx, ImplementationPrompt, messages, &reply)
 	if err != nil {
@@ -116,6 +138,8 @@ func (a *Activities) GenerateImplementation(ctx context.Context, in GenerateImpl
 	}
 	impl.PromptVersion = ImplementationPromptVersion
 	impl.Model = resp.Model
+	impl.ContextRefusals = in.Refusals
+	impl.RoundBoundReached = in.RoundBoundReached
 	if activity.IsActivity(ctx) {
 		logger := activity.GetLogger(ctx)
 		logger.Info("generated implementation",
@@ -166,11 +190,13 @@ func implementationFromReply(taskID string, reply ImplementationReply) (Implemen
 	return impl, nil
 }
 
-// implementationUserPrompt renders the user turn of the implementation
-// chat: the task, the repository listing, and the relevant file
-// contents, in that order (the task first, so it survives any
-// truncation of the context).
-func implementationUserPrompt(in GenerateImplementationInput) string {
+// seedPrompt renders the first user turn of the implementation chat: the
+// task, then the seed context chosen from it (the file listing and the
+// contents of the files the task is likely to touch), in that order (the
+// task first, so it survives any truncation of the context). It is the
+// first message of the context conversation, so the model sees it in
+// every round.
+func seedPrompt(in GenerateImplementationInput) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "# Task %s: %s\n\n", in.Task.ID, in.Task.Title)
@@ -178,37 +204,42 @@ func implementationUserPrompt(in GenerateImplementationInput) string {
 	b.WriteString("## Task file\n\n")
 	b.WriteString(strings.TrimSpace(in.Task.Content))
 	b.WriteString("\n\n")
-
-	b.WriteString("## Repository files\n\n")
-	if len(in.Files) == 0 {
-		b.WriteString("(no file listing was provided)\n\n")
-	} else {
-		fmt.Fprintf(&b, "%d file(s) listed", len(in.Files))
-		if in.Truncated {
-			b.WriteString(" (the listing is truncated)")
-		}
-		b.WriteString(":\n\n```\n")
-		for _, f := range in.Files {
-			b.WriteString(f.Path)
-			b.WriteByte('\n')
-		}
-		b.WriteString("```\n\n")
-	}
-
-	b.WriteString("## File contents\n\n")
-	if len(in.Contents) == 0 {
-		b.WriteString("(none of the files were provided; propose new files, or report a partial outcome when you need to see existing code)\n")
-		return b.String()
-	}
-	for _, f := range in.Contents {
-		fmt.Fprintf(&b, "### %s\n\n```\n", f.Path)
-		b.WriteString(truncateContext(f.Content))
-		if !strings.HasSuffix(f.Content, "\n") {
-			b.WriteByte('\n')
-		}
-		b.WriteString("```\n\n")
-	}
+	b.WriteString(renderContext(in.Context, in.Task.Path))
 	return b.String()
+}
+
+// implementationUserPrompt renders the user turn of the final,
+// propose-only round: the context assembled across every round, the
+// refusals the budget recorded, and the instruction that this round
+// cannot issue requests. The seed prompt (seedPrompt) is the first user
+// turn of the conversation.
+func implementationUserPrompt(in GenerateImplementationInput) string {
+	var b strings.Builder
+
+	if in.RoundBoundReached {
+		fmt.Fprintf(&b, "## Final round: propose only\n\nYou used all %d context request rounds without proposing. This round cannot issue requests: propose the implementation with the context below.\n\n", maxContextRounds)
+	} else {
+		b.WriteString("## Propose the implementation\n\nThis round cannot issue requests: propose the implementation with the context below.\n\n")
+	}
+	writeRefusals(&b, in.Refusals)
+	b.WriteString(renderContext(in.Context, in.Task.Path))
+	return b.String()
+}
+
+// writeRefusals renders the budget refusals, so the model knows which
+// context it asked for and did not get.
+func writeRefusals(b *strings.Builder, refusals []ContextRefusal) {
+	if len(refusals) == 0 {
+		return
+	}
+	b.WriteString("## Refused requests\n\n")
+	b.WriteString("The context budget refused these requests; the context below does not include them. Report a partial outcome naming them when they block the task.\n\n")
+	for _, r := range refusals {
+		b.WriteString("- ")
+		b.WriteString(r.String())
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
 }
 
 // truncateContext bounds one file's content to maxContextFileBytes on a

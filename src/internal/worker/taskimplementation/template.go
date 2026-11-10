@@ -31,14 +31,16 @@ func (template) Workflows() []worker.Workflow {
 // Activities lists the activity types the template registers: the routing
 // check that declines commits the agent must not act on, the repository
 // tooling the implementation workflow reads the task, inspects the
-// repository, and commits its changes through, and the LLM step that
-// implements the task.
+// repository, and commits its changes through, the LLM steps that run the
+// context conversation and implement the task.
 func (t template) Activities() []worker.Activity {
 	return []worker.Activity{
 		{Name: CheckCommitName, Fn: t.activities.CheckCommit},
 		{Name: ReadTaskName, Fn: t.activities.ReadTask},
 		{Name: ListRepositoryName, Fn: t.activities.ListRepository},
 		{Name: ReadFilesName, Fn: t.activities.ReadFiles},
+		{Name: SearchRepositoryName, Fn: t.activities.SearchRepository},
+		{Name: RequestContextName, Fn: t.activities.RequestContext},
 		{Name: GenerateImplementationName, Fn: t.activities.GenerateImplementation},
 		{Name: CreateImplementationBranchName, Fn: t.activities.CreateImplementationBranch},
 		{Name: CommitImplementationName, Fn: t.activities.CommitImplementation},

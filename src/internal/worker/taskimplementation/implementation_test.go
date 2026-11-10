@@ -150,8 +150,10 @@ func implementationInput() GenerateImplementationInput {
 			Content:            "---\nid: TASK-019\n---\n\n## Description\n\nAdd login to src/main.go.\n",
 			AcceptanceCriteria: []string{"Login works"},
 		},
-		Files:    []FileEntry{{Path: "src/main.go", Size: 13}, {Path: "README.md", Size: 10}},
-		Contents: []ReadFile{{Path: "src/main.go", Content: "package main\n"}},
+		Context: Context{
+			Files:    []FileEntry{{Path: "src/main.go", Size: 13}, {Path: "README.md", Size: 10}},
+			Contents: []ReadFile{{Path: "src/main.go", Content: "package main\n"}},
+		},
 	}
 }
 
@@ -163,7 +165,9 @@ func TestGenerateImplementation(t *testing.T) {
 	lf := llm.NewFake(llm.Response{Content: reply, Model: "test-model"})
 	acts := NewActivities(provider.NewFake(repo), lf)
 
-	impl, err := acts.GenerateImplementation(t.Context(), implementationInput())
+	in := implementationInput()
+	in.History = []llm.Message{{Role: llm.RoleUser, Content: seedPrompt(in)}}
+	impl, err := acts.GenerateImplementation(t.Context(), in)
 	if err != nil {
 		t.Fatalf("GenerateImplementation: %v", err)
 	}
@@ -183,8 +187,9 @@ func TestGenerateImplementation(t *testing.T) {
 		t.Errorf("changes[1].Content = %q, want the complete new content", impl.Changes[1].Content)
 	}
 
-	// The LLM saw the implementation prompt and a user turn carrying the
-	// task, the listing, and the file contents.
+	// The LLM saw the implementation prompt, the seed prompt the
+	// workflow supplies as history (carrying the task and the seeded
+	// context), and the propose-only turn.
 	calls := lf.Calls()
 	if len(calls) != 1 {
 		t.Fatalf("llm calls = %d, want 1", len(calls))
@@ -195,10 +200,10 @@ func TestGenerateImplementation(t *testing.T) {
 	if !calls[0].JSON {
 		t.Error("llm call was not in JSON mode")
 	}
-	if len(calls[0].Messages) != 1 {
-		t.Fatalf("messages = %d, want 1", len(calls[0].Messages))
+	if len(calls[0].Messages) != 2 {
+		t.Fatalf("messages = %d, want the seed prompt and the propose-only turn", len(calls[0].Messages))
 	}
-	prompt := calls[0].Messages[0].Content
+	seed := calls[0].Messages[0].Content
 	for _, want := range []string{
 		"# Task TASK-019: Implement login",
 		"Add login to src/main.go.",
@@ -206,9 +211,12 @@ func TestGenerateImplementation(t *testing.T) {
 		"README.md",
 		"package main",
 	} {
-		if !strings.Contains(prompt, want) {
-			t.Errorf("user prompt misses %q:\n%s", want, prompt)
+		if !strings.Contains(seed, want) {
+			t.Errorf("seed prompt misses %q:\n%s", want, seed)
 		}
+	}
+	if !strings.Contains(calls[0].Messages[1].Content, "cannot issue requests") {
+		t.Errorf("final turn = %q, want the propose-only instruction", calls[0].Messages[1].Content)
 	}
 }
 
@@ -288,7 +296,7 @@ func TestGenerateImplementationErrors(t *testing.T) {
 func TestImplementationUserPromptTruncatesLargeFiles(t *testing.T) {
 	big := strings.Repeat("x", maxContextFileBytes+10)
 	in := implementationInput()
-	in.Contents = []ReadFile{{Path: "big.go", Content: big}}
+	in.Context.Contents = []ReadFile{{Path: "big.go", Content: big}}
 	prompt := implementationUserPrompt(in)
 	if !strings.Contains(prompt, "file truncated") {
 		t.Error("prompt does not mark the truncated file")
@@ -300,9 +308,12 @@ func TestImplementationUserPromptTruncatesLargeFiles(t *testing.T) {
 
 func TestImplementationUserPromptWithoutContents(t *testing.T) {
 	in := implementationInput()
-	in.Contents = nil
+	in.Context.Contents = nil
 	prompt := implementationUserPrompt(in)
-	if !strings.Contains(prompt, "report a partial outcome") {
-		t.Errorf("prompt = %q, want the instruction for missing context", prompt)
+	if !strings.Contains(prompt, "cannot issue requests") {
+		t.Errorf("prompt = %q, want the propose-only instruction", prompt)
+	}
+	if !strings.Contains(prompt, "no file contents yet") {
+		t.Errorf("prompt = %q, want the missing-context note", prompt)
 	}
 }

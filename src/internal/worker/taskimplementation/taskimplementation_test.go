@@ -246,13 +246,15 @@ func TestTemplateRegistration(t *testing.T) {
 		ReadTaskName,
 		ListRepositoryName,
 		ReadFilesName,
+		SearchRepositoryName,
+		RequestContextName,
 		GenerateImplementationName,
 		CreateImplementationBranchName,
 		CommitImplementationName,
 		SubmitMergeRequestName,
 	}
 	if len(acts) != len(wantNames) {
-		t.Fatalf("activities = %d, want %d (the routing check and the repository tooling)", len(acts), len(wantNames))
+		t.Fatalf("activities = %d, want %d (the routing check, the repository tooling, and the LLM steps)", len(acts), len(wantNames))
 	}
 	for i, want := range wantNames {
 		if acts[i].Name != want || acts[i].Fn == nil {
@@ -297,6 +299,8 @@ func TestWorkflowImplementsTask(t *testing.T) {
 		Return(RepositoryListing{Files: []FileEntry{{Path: "src/main.go", Size: 10}}}, nil)
 	env.OnActivity(ReadFilesName, mock.Anything, mock.Anything).
 		Return([]ReadFile{{Path: "src/main.go", Content: "package main\n"}}, nil)
+	env.OnActivity(RequestContextName, mock.Anything, mock.Anything).
+		Return(ContextRound{}, nil)
 	env.OnActivity(GenerateImplementationName, mock.Anything, mock.Anything).
 		Return(Implementation{
 			TaskID:        "TASK-019",
@@ -375,6 +379,8 @@ func TestWorkflowReportsPartialImplementation(t *testing.T) {
 		Return(RepositoryListing{}, nil)
 	env.OnActivity(ReadFilesName, mock.Anything, mock.Anything).
 		Return([]ReadFile{}, nil)
+	env.OnActivity(RequestContextName, mock.Anything, mock.Anything).
+		Return(ContextRound{}, nil)
 	env.OnActivity(GenerateImplementationName, mock.Anything, mock.Anything).
 		Return(Implementation{
 			TaskID:        "TASK-019",
@@ -432,6 +438,8 @@ func TestWorkflowPartialWithoutChangesKeepsBranch(t *testing.T) {
 		Return(RepositoryListing{}, nil)
 	env.OnActivity(ReadFilesName, mock.Anything, mock.Anything).
 		Return([]ReadFile{}, nil)
+	env.OnActivity(RequestContextName, mock.Anything, mock.Anything).
+		Return(ContextRound{}, nil)
 	env.OnActivity(GenerateImplementationName, mock.Anything, mock.Anything).
 		Return(Implementation{TaskID: "TASK-019", Reason: "the task contradicts the code"}, nil)
 	env.OnActivity(CreateImplementationBranchName, mock.Anything, mock.Anything).
@@ -467,6 +475,8 @@ func TestWorkflowKeepsOnlyBacklogTaskPaths(t *testing.T) {
 		Return(Task{Path: taskPath, ID: "TASK-019", Title: "Implement login"}, nil)
 	env.OnActivity(ListRepositoryName, mock.Anything, mock.Anything).Return(RepositoryListing{}, nil)
 	env.OnActivity(ReadFilesName, mock.Anything, mock.Anything).Return([]ReadFile{}, nil)
+	env.OnActivity(RequestContextName, mock.Anything, mock.Anything).
+		Return(ContextRound{}, nil)
 	env.OnActivity(GenerateImplementationName, mock.Anything, mock.Anything).
 		Return(Implementation{TaskID: "TASK-019", Complete: true}, nil)
 	env.OnActivity(CreateImplementationBranchName, mock.Anything, mock.Anything).
