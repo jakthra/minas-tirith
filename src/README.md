@@ -6,8 +6,8 @@ the agent workflows they trigger on Temporal, and an agent worker that
 executes those workflows durably.
 
 Two binaries, one Go module (`minas-tirith`, built with the Go standard
-library, the Temporal Go SDK, and a YAML parser for the declarative
-config):
+library, the Temporal Go SDK, a YAML parser for the declarative config,
+and cobra for the installer's command line):
 
 - **`cmd/listener`** — the webhook event listener. Receives webhooks
   (Forgejo today, other providers one adapter away), verifies their
@@ -17,6 +17,8 @@ config):
   it polls task queues and executes the registered agent workflows and
   activities. It opens no inbound port and receives no webhooks; the
   listener starts the workflows.
+- **`cmd/install`** — the interactive installer that onboards a
+  repository (see [Installer](#installer)).
 
 Deployments that run agents point the repository webhooks at the listener
 and run the worker alongside it; the worker connects to the same Temporal
@@ -134,6 +136,40 @@ the wiring examples below. Running from `src/`, both binaries load it
 automatically when `WATCHED_CONFIG` is unset — no flags, no env. It is
 a development convenience only: point `WATCHED_CONFIG` at your own file
 for anything else, and change the secret before any real use.
+
+### Installer
+
+`cmd/install` onboards a repository interactively, so connecting a
+repository does not mean hand-editing the config file:
+
+```sh
+go run ./cmd/install
+```
+
+The flow asks three questions:
+
+1. **Git provider** — Forgejo is the only provider offered today,
+   preselected; answer with its number or name.
+2. **Repository** — as `owner/name` (e.g. `root/BeanieGenie`). The
+   answer is validated and re-prompted until both parts are valid
+   names (letters, digits, `.`, `_`, `-`).
+3. **Access token** — that repository's own provider token. On a
+   terminal the input is hidden and never echoed; when stdin is piped
+   the token is read as an ordinary line, so scripts can drive the
+   flow.
+
+Every answer can be preset with a flag or environment variable —
+`--provider`/`INSTALL_PROVIDER`, `--repo`/`INSTALL_REPO`,
+`--token`/`INSTALL_TOKEN` — and a preset answer is not asked for. The
+flags follow the usual precedence (flag, then environment variable,
+then the built-in default); a token passed as a flag is visible in the
+process list, so prefer the hidden prompt or `INSTALL_TOKEN`.
+
+The prompt flow lives in `internal/installer` over injectable input and
+output streams, so it is unit-tested without a terminal. Today the
+installer stops after collecting the answers and prints them; creating
+the webhook and writing the repository into the watched-repositories
+config file is the next step (TASK-27.4).
 
 ### Temporal server
 
@@ -472,6 +508,9 @@ Webhook ──► cmd/listener ──► Temporal ──► cmd/worker
 cmd/listener            listener entry point: config, Temporal starter,
                         event bridge, logging consumer, HTTP server, lifecycle
 cmd/worker              worker entry point: config, Temporal workers, lifecycle
+cmd/install             installer entry point: cobra command, prompt flow wiring
+internal/installer      interactive onboarding prompt flow (provider, repository,
+                        access token) over injectable streams; no API calls yet
 internal/config         flag + env configuration (listener + worker)
 internal/configstore    declarative config store for watched repos: Store interface,
                         File (YAML/JSON config file, per-repo webhook secrets),
