@@ -9,6 +9,11 @@ default:
 test:
     go test ./...
 
+# Onboard the dev template repository to the running listener (see README).
+[working-directory('src')]
+install-dev:
+    go run ./cmd/install --repo root/BeanieGenie --listener-url http://169.254.1.2:9797
+
 # Run the webhook event listener (:9797): receives webhooks, starts workflows.
 # Runs in src/, so the binary loads src/.env at startup: local values
 # without any shell setup (see src/.env.example).
